@@ -34,6 +34,19 @@
 ║           If today's zones+context already in Redis, ║
 ║           recover them instead (Telegram alert +     ║
 ║           recovery_log entry, shown in EOD summary)  ║
+║  FIX 20 : Structure-shift flag — Python tracks zone  ║
+║           flips in real time (flip_log), flags 2+    ║
+║           same-direction flips within 60min to the   ║
+║           AI without waiting for next hourly bias    ║
+║  FIX 21 : ZONE_DECISION_SYSTEM now tells the AI the  ║
+║           [MORNING CONTEXT] bias can be ~58min stale ║
+║           — weigh current candles over old bias      ║
+║  FIX 22 : PCR-reversal confluence module — injected  ║
+║           only for reversal-type events, applies     ║
+║           PCR>1.5@support / PCR<0.7@resistance rule  ║
+║  FIX 23 : AI reason/risk_note/confirmations now      ║
+║           logged directly (Koyeb logs), not just     ║
+║           buried in Redis ai_raw_log                 ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -666,6 +679,27 @@ def _dominance_block(dominance):
     )
 
 
+def _structure_shift_block(shift):
+    """
+    FIX 20: Formats the Python-detected structure-shift fact (see
+    get_structure_shift()) into a prompt block. Explicitly flags that
+    [MORNING CONTEXT] Bias/Structure may be stale relative to this —
+    the AI is told to weigh this real-time signal alongside candles,
+    not treat the old bias as the final word.
+    """
+    if not shift:
+        return ""
+    return (
+        f"\n\n[STRUCTURE SHIFT DETECTED — Python-tracked, real-time]\n"
+        f"{shift['count']} zone flip(s) in the '{shift['direction'].upper()}' "
+        f"direction since {shift['since']} (within the last hour).\n"
+        f"NOTE: The [MORNING CONTEXT] Bias/Structure above is from the last "
+        f"hourly reanalysis and may not reflect this yet — weigh this "
+        f"real-time structure signal together with the current candles, "
+        f"not just the (possibly stale) bias label."
+    )
+
+
 def build_zone_decision_string(tf_data, ltp, touched_zone, all_zones, morning_ctx,
                                 oi_context=None, context_zones=None, dominance=None):
     """Build compact string for zone touch decision"""
@@ -820,9 +854,70 @@ def get_recovery_log():
     return _get("recovery_log") or []
 
 
+def save_flip_event(zone_id, direction):
+    """
+    FIX 20: Records the moment a zone actually flips (RESISTANCE→
+    FLIP_SUPPORT = 'up' break, SUPPORT→FLIP_RESISTANCE = 'down' break).
+    This is Python-side and happens the instant maybe_flip_zone() fires
+    in zone_monitor_job() — it does NOT wait for the next hourly
+    reanalysis. Purpose: detect a same-direction structure shift across
+    multiple zones within the hour, well before hourly_job() eventually
+    updates morning_context['bias'] to match reality.
+    """
+    events = _get("flip_log") or []
+    events.append({
+        "time":      datetime.now(IST).strftime("%H:%M"),
+        "zone_id":   zone_id,
+        "direction": direction
+    })
+    _set("flip_log", events[-20:])  # last 20 is plenty for a single day
+
+
+def get_structure_shift(window_minutes=60, min_flips=2):
+    """
+    FIX 20: Reads recent flip events (see save_flip_event). If
+    `min_flips` or more flips in the SAME direction happened within the
+    last `window_minutes`, returns a factual dict — otherwise None.
+    Deliberately no "bias"/"lean" language here, same principle as
+    get_context_zones()/_dominance_block() — Python reports facts, the
+    AI decides what to do with them.
+    """
+    events = _get("flip_log") or []
+    if not events:
+        return None
+
+    now = datetime.now(IST)
+    recent = []
+    for e in events:
+        try:
+            t = datetime.strptime(e["time"], "%H:%M").replace(
+                year=now.year, month=now.month, day=now.day
+            )
+            t = IST.localize(t)
+            if 0 <= (now - t).total_seconds() / 60 <= window_minutes:
+                recent.append(e)
+        except Exception:
+            continue
+
+    if len(recent) < min_flips:
+        return None
+
+    down_count = sum(1 for e in recent if e["direction"] == "down")
+    up_count   = sum(1 for e in recent if e["direction"] == "up")
+
+    if down_count >= min_flips and down_count > up_count:
+        matches = [e for e in recent if e["direction"] == "down"]
+        return {"direction": "down", "count": len(matches), "since": matches[0]["time"]}
+    if up_count >= min_flips and up_count > down_count:
+        matches = [e for e in recent if e["direction"] == "up"]
+        return {"direction": "up", "count": len(matches), "since": matches[0]["time"]}
+
+    return None
+
+
 def flush_day():
     for k in ["zones", "zones_date", "morning_context", "morning_context_date",
-              "signal_history", "ai_raw_log", "recovery_log"]:
+              "signal_history", "ai_raw_log", "recovery_log", "flip_log"]:
         _delete(k)
     log.info("🧹 Day data flushed")
 
@@ -1409,6 +1504,42 @@ LIQUIDITY FIGHT MODULE (a dominance candle was detected — see the
   not a confirmed signal, unless the next candle confirms.
 """
 
+# FIX 22: Only injected for reversal-type events (rejection/reclaim/
+# retest at a zone) AND only when OI context is available. This is the
+# user's own long-standing OI philosophy (PCR>1.5=support wall,
+# PCR<0.7=resistance wall) applied specifically to confirm-or-doubt a
+# reversal candle — separate from the general OI_INTERPRETATION_MODULE,
+# which is about OI/PCR trend direction generally, not zone-confluence.
+PCR_REVERSAL_EVENTS = {
+    "SUPPORT_REJECTION", "RESISTANCE_REJECTION",
+    "BULLISH_SWEEP_RECLAIM", "BEARISH_SWEEP_REJECT", "RETEST_HOLD"
+}
+
+PCR_CONFLUENCE_MODULE = """
+PCR-REVERSAL CONFLUENCE MODULE (this is a reversal-type setup — check
+this alongside OI_INTERPRETATION_MODULE above):
+
+- PCR > 1.5 at a SUPPORT zone = strong put-writing wall = genuine
+  support confluence.
+- PCR < 0.7 at a RESISTANCE zone = strong call-writing wall = genuine
+  resistance confluence.
+- At SUPPORT: current PCR > 1.5 AND the most recent PCR leg is falling
+  = bullish reversal confluence with the candle event → this can raise
+  confidence toward HIGH if candles also confirm.
+- At SUPPORT: current PCR < 1.0, OR PCR rising while price bounces =
+  the OI does NOT support this bounce (no real put wall here) → treat
+  as a weaker/possible-trap setup, lean WAIT or lower confidence even
+  if the candle looks clean.
+- At RESISTANCE: current PCR < 0.7 AND the most recent PCR leg is
+  rising = bearish reversal confluence → can raise confidence toward
+  HIGH if candles also confirm.
+- At RESISTANCE: current PCR > 1.0, OR PCR falling while price
+  rejects = OI does NOT support this rejection → lean WAIT or lower
+  confidence.
+- If OI context is unavailable (N/A) this module does not apply —
+  judge from candles alone.
+"""
+
 FIRST_ANALYSIS_SYSTEM = """You are an expert NIFTY50 price-action zone analyst.
 The user manually confirms every trade. This is NOT auto-trading.
 
@@ -1489,6 +1620,20 @@ RULES:
 - Need minimum 2 REAL confirmations for BUY_CE or BUY_PE
 - confidence LOW → WAIT
 - Direction unclear → WAIT. Never force signal.
+
+BIAS FRESHNESS (read this carefully):
+- The [MORNING CONTEXT] Bias/Structure fields are from the LAST HOURLY
+  reanalysis (runs at :02 past each hour) — they can be up to ~58
+  minutes stale, NOT real-time.
+- If the current 5M/15M candles and the touched zone's detected event
+  clearly CONTRADICT this bias (e.g. bias says LONG but candles show a
+  clean breakdown with 2+ real confirmations), trust the current
+  candles over the stale bias label. Do not let an outdated bias alone
+  push you to WAIT when the immediate price action is clear.
+- If a [STRUCTURE SHIFT DETECTED] block is present below, treat it as
+  a stronger real-time signal than the morning bias — it means Python
+  has already detected multiple zones breaking in the same new
+  direction since the bias was last computed.
 
 CHoCH RULE:
 Bullish: price swept below support → reclaimed above → minor lower-high broken
@@ -1646,6 +1791,8 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
     m5_for_dom    = drop_incomplete_candle(tf_data.get("m5", pd.DataFrame()), 5)
     dominance     = detect_dominance_candle(m5_for_dom, ltp)
     context_zones = get_context_zones(ltp, all_zones)
+    # FIX 20: real-time structure-shift fact, independent of hourly bias
+    structure_shift = get_structure_shift()
 
     data_str = build_zone_decision_string(
         tf_data, ltp, touched_zone, all_zones, morning_ctx,
@@ -1656,6 +1803,8 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
     if event and event != "NO_EVENT":
         event_block = f"\n\n[DETECTED CANDLE EVENT]\nEvent: {event}\nDetail: {event_reason}"
 
+    shift_block = _structure_shift_block(structure_shift)
+
     situation_module = PROMPT_MODULES.get(event, "")
     system_prompt    = ZONE_DECISION_SYSTEM
     if situation_module:
@@ -1664,8 +1813,11 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
         system_prompt += f"\n\n{LIQUIDITY_FIGHT_MODULE}"
     if oi_context:
         system_prompt += OI_INTERPRETATION_MODULE
+        # FIX 22: PCR-reversal confluence — only for reversal-type events
+        if event in PCR_REVERSAL_EVENTS:
+            system_prompt += f"\n\n{PCR_CONFLUENCE_MODULE}"
 
-    user_prompt = data_str + event_block + """
+    user_prompt = data_str + event_block + shift_block + """
 
 RETURN ONLY this JSON:
 {
@@ -1701,9 +1853,23 @@ RETURN ONLY this JSON:
         "zone_id": touched_zone.get("id"),
         "ltp":     ltp,
         "dominance_found": bool(dominance),
+        "structure_shift": structure_shift,
         "raw":     raw[:500] if raw else None,
         "parsed":  bool(result)
     })
+
+    # FIX 23: reason/risk_note/confirmations straight into Koyeb logs —
+    # previously only visible by digging into Redis ai_raw_log. This is
+    # what answers "why did the AI WAIT here" without extra steps.
+    if result:
+        log.info(
+            f"🧠 {result.get('signal','?')} | conf:{result.get('confidence','?')} "
+            f"| reason: {result.get('reason','')}"
+        )
+        if result.get("risk_note"):
+            log.info(f"🧠 risk_note: {result.get('risk_note')}")
+        if result.get("confirmations"):
+            log.info(f"🧠 confirmations: {result.get('confirmations')}")
 
     return result
 
@@ -2163,6 +2329,11 @@ def zone_monitor_job():
             ]
             save_zones(updated_zones)
             zones = updated_zones
+            # FIX 20: track flip direction for real-time structure-shift
+            # detection — RESISTANCE→FLIP_SUPPORT is an upward break,
+            # SUPPORT→FLIP_RESISTANCE is a downward break.
+            flip_direction = "up" if updated_zone["type"] == "FLIP_SUPPORT" else "down"
+            save_flip_event(zone_id, flip_direction)
             log.info(
                 f"🔄 Zone flipped: {zone_id} "
                 f"{touched['type']} → {updated_zone['type']} @ LTP:{ltp}"
