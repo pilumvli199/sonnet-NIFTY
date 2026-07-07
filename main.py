@@ -27,6 +27,13 @@
 ║  FIX 12 : get_context_zones() — adds factual S/R     ║
 ║           range + position% to prompt, no AI-biasing ║
 ║           "lean" language                            ║
+║  FIX 18 : Logging timestamps now IST (was server     ║
+║           local/UTC) — ISTFormatter                  ║
+║  FIX 19 : Restart-persistence — main() no longer     ║
+║           blindly re-runs morning_job() on restart.  ║
+║           If today's zones+context already in Redis, ║
+║           recover them instead (Telegram alert +     ║
+║           recovery_log entry, shown in EOD summary)  ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -51,15 +58,34 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
-# ── Logging ──────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
-)
-log = logging.getLogger("ZoneBot")
-
-# ── Timezone ─────────────────────────────────────────
+# ── Timezone (moved above logging setup — FIX 18 needs this first) ──
 IST = pytz.timezone("Asia/Kolkata")
+
+
+# ── Logging (FIX 18: IST timestamps, not server-local/UTC) ─────────
+class ISTFormatter(logging.Formatter):
+    """
+    Koyeb (and most hosts) run containers on UTC. Default logging.Formatter
+    uses time.localtime() → UTC on the server → every log line was showing
+    UTC time, ~5.5hr behind actual IST market time, making log correlation
+    with Telegram alerts / candle times confusing.
+    This formatter converts record.created (a UTC epoch timestamp) to IST
+    explicitly, using the same `IST` pytz object used everywhere else in
+    the bot — no separate zoneinfo import, no second source of truth.
+    """
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=pytz.utc).astimezone(IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    ISTFormatter("%(asctime)s IST | %(levelname)s | %(message)s")
+)
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+log = logging.getLogger("ZoneBot")
 
 # ── ENV Variables ─────────────────────────────────────
 UPSTOX_TOKEN  = os.getenv("UPSTOX_ANALYTICS_TOKEN", "")
@@ -736,7 +762,15 @@ def _delete(key):
 
 
 def save_zones(zones):
+    """
+    FIX 19: also stamps today's IST date alongside the zones, so a
+    restart can tell whether these zones belong to today or are stale
+    from before a crash boundary. Without this stamp there was no way
+    to distinguish "today's zones, just saved" from "yesterday's zones
+    that never got flushed" on restart.
+    """
     _set("zones", zones[:MAX_ZONES])
+    _set("zones_date", datetime.now(IST).strftime("%Y-%m-%d"))
     log.info(f"✅ {len(zones)} zones saved")
 
 
@@ -745,15 +779,50 @@ def get_zones():
 
 
 def save_morning_context(ctx):
+    """FIX 19: date-stamped alongside — see save_zones() note."""
     _set("morning_context", ctx)
+    _set("morning_context_date", datetime.now(IST).strftime("%Y-%m-%d"))
 
 
 def get_morning_context():
     return _get("morning_context")
 
 
+def is_today_data_valid():
+    """
+    FIX 19: Restart-recovery check. Returns True only if BOTH zones and
+    morning_context exist in Redis AND both were stamped with today's
+    IST date. Used by main() on startup to decide: recover existing
+    data (restart mid-day) vs run a fresh morning_job() (first-ever
+    start, or data missing/stale from a previous day that somehow
+    survived without being flushed).
+    """
+    today       = datetime.now(IST).strftime("%Y-%m-%d")
+    zones       = get_zones()
+    ctx         = get_morning_context()
+    zones_date  = _get("zones_date")
+    ctx_date    = _get("morning_context_date")
+    return bool(zones and ctx and zones_date == today and ctx_date == today)
+
+
+def save_recovery_log(entry):
+    """
+    FIX 19: Tracks restart-recovery events for the day so they're
+    auditable later (not just a Telegram message that scrolls away) —
+    surfaced in the EOD summary's "Restarts Today" section.
+    """
+    logs = _get("recovery_log") or []
+    logs.append(entry)
+    _set("recovery_log", logs)
+
+
+def get_recovery_log():
+    return _get("recovery_log") or []
+
+
 def flush_day():
-    for k in ["zones", "morning_context", "signal_history", "ai_raw_log"]:
+    for k in ["zones", "zones_date", "morning_context", "morning_context_date",
+              "signal_history", "ai_raw_log", "recovery_log"]:
         _delete(k)
     log.info("🧹 Day data flushed")
 
@@ -1725,6 +1794,11 @@ def run_eod_summary():
     FIX 5: This MUST run (and read signal_history) BEFORE closing_job()
     renames "OPEN" → "EOD_OPEN", otherwise still_open always reads 0
     even when trades were genuinely open at close.
+    FIX 19: Now also shows a "Restarts Today" section from recovery_log,
+    so a mid-day restart-and-recover event is visible right in the same
+    summary, next to the signals that were logged before/after it — this
+    is what makes a restart-test (e.g. restart at 3pm, check 3:30 summary)
+    actually verifiable instead of just "trusting" nothing broke.
     """
     history = get_signal_history()
     today   = datetime.now(IST).strftime("%d %b %Y")
@@ -1750,6 +1824,18 @@ def run_eod_summary():
               "⏳" if r=="OPEN" else "⚪")
         detail += f"\n{em} {s['time']} {esc(s['signal'])} @ {esc(s.get('zone_id','?'))} → {esc(r)}"
 
+    # FIX 19: restart-recovery events today
+    recoveries = get_recovery_log()
+    recovery_block = ""
+    if recoveries:
+        recovery_block = "\n\n<b>🔁 Restarts Today:</b>"
+        for rec in recoveries:
+            recovery_block += (
+                f"\n♻️ {rec.get('time','?')} — recovered "
+                f"{rec.get('zones_recovered',0)} zones, "
+                f"{rec.get('signals_recovered',0)} signals were logged so far"
+            )
+
     msg = f"""📈 <b>DAY SUMMARY | {today}</b>
 
 Signals scanned : {len(history)}
@@ -1763,7 +1849,7 @@ Signals scanned : {len(history)}
 ❌ Ref SL    : {ref_sl}
 ⏰ Expired   : {expired}
 ⏳ Open      : {still_open}
-{detail}"""
+{detail}{recovery_block}"""
 
     tg_send(msg)
     log.info("✅ EOD summary sent")
@@ -1831,6 +1917,32 @@ Manual chart confirm karach trade ghe!"""
 
     tg_send(msg)
     log.info("✅ Zone brief sent")
+
+
+def send_recovery_alert(zones, ctx, history):
+    """
+    FIX 19: Sent when the bot restarts mid-day and recovers today's
+    zones/context from Redis instead of running a fresh morning_job().
+    Keeps the user in the loop that a restart happened AND that it did
+    NOT silently wipe/replace the day's zones.
+    """
+    now_str = datetime.now(IST).strftime("%H:%M:%S")
+    bias    = esc(ctx.get("bias","?")) if ctx else "?"
+    struct  = esc(ctx.get("structure","?")) if ctx else "?"
+
+    msg = f"""♻️ <b>Bot Restarted — Recovered from Redis</b>
+
+Time      : {now_str} IST
+Zones     : {len(zones)} recovered
+Signals   : {len(history)} already logged today
+Bias      : {bias} | Structure: {struct}
+
+Fresh analysis SKIPPED — using today's existing zones/context.
+(Check 3:30 PM EOD summary — it will list this restart, and all
+signals logged before this restart should still be counted there.)"""
+
+    tg_send(msg)
+    log.info("✅ Recovery alert sent")
 
 
 def send_signal(result, ltp, touched_zone):
@@ -2160,7 +2272,6 @@ def main():
         f"🚀 <b>Zone Assistant Bot Started!</b>\n"
         f"Time: {now.strftime('%H:%M IST')}\n"
         f"Analysis model: {esc(ANALYSIS_MODEL)} | Decision model: {esc(DECISION_MODEL)}\n"
-        f"Running first analysis now..."
     )
 
     scheduler = BackgroundScheduler(timezone=IST)
@@ -2196,9 +2307,35 @@ def main():
     log.info("   Zone monitor      : Every 5min :10sec")
     log.info("   EOD summary       : 15:30 IST")
 
+    # FIX 19: Restart-persistence check.
+    # Previously this block unconditionally called morning_job() any
+    # time the process started during market hours — including a
+    # mid-day restart at, say, 11:00 or 15:00. That blindly overwrote
+    # today's zones/context (built from hours of accumulated hourly_job
+    # merges) with a fresh from-scratch analysis, and reset the OI
+    # volume baseline too. Now: if today's zones+context are already in
+    # Redis (stamped with today's IST date), recover and reuse them —
+    # only run a fresh morning_job() if nothing valid for today exists
+    # yet (true first start, or a day where data never got saved).
     if is_market_open():
-        log.info("Market open → running first analysis now...")
-        morning_job()
+        if is_today_data_valid():
+            zones   = get_zones()
+            ctx     = get_morning_context()
+            history = get_signal_history()
+            log.info(
+                f"♻️ RESTART RECOVERY: today's zones/context found in Redis "
+                f"({len(zones)} zones, {len(history)} signals logged so far) "
+                f"— skipping fresh morning_job()"
+            )
+            save_recovery_log({
+                "time":              now.strftime("%H:%M:%S"),
+                "zones_recovered":   len(zones),
+                "signals_recovered": len(history)
+            })
+            send_recovery_alert(zones, ctx, history)
+        else:
+            log.info("Market open, no valid today's data in Redis → running first analysis now...")
+            morning_job()
 
     flask_app = Flask(__name__)
 
@@ -2218,6 +2355,7 @@ def main():
             "bias":            ctx.get("bias","?") if ctx else "?",
             "zones_active":    len(zones),
             "signals_today":   len(history),
+            "restarts_today":  len(get_recovery_log()),
             "analysis_model":  ANALYSIS_MODEL,
             "decision_model":  DECISION_MODEL,
             "scheduler":       "running" if scheduler.running else "stopped"
