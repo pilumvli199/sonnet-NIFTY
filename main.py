@@ -47,6 +47,24 @@
 ║  FIX 23 : AI reason/risk_note/confirmations now      ║
 ║           logged directly (Koyeb logs), not just     ║
 ║           buried in Redis ai_raw_log                 ║
+║  FIX A1/A2: OI storage now dual-range — ATM±8 saved  ║
+║           (17 strikes) so a later reslice survives   ║
+║           ATM drift; current-tick totals/PCR/walls   ║
+║           still computed from ATM±3 only (unchanged) ║
+║  FIX A3/A4: format_oi_context() recomputes past CE/  ║
+║           PE OI + PCR by reslicing the past wide     ║
+║           snapshot around the CURRENT atm — not by   ║
+║           trusting its own stale-ATM cached totals   ║
+║  FIX A5 : >250pt ATM shift (no real overlap) → N/A,  ║
+║           never a misleading partial number          ║
+║  FIX B1 : New CE_WALL_CHG/PE_WALL_CHG — absolute OI  ║
+║           change in lakhs at the wall strikes,       ║
+║           floor-filtered (±0.3L), not a PCR-style    ║
+║           ratio                                      ║
+║  FIX D1+E1+E2: OI Redis keys now date-namespaced     ║
+║           (oi:{date}:{HH:MM}), TTL raised to 7 days   ║
+║           for OI keys only (zones/context untouched, ║
+║           still flushed daily as before)             ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -341,11 +359,49 @@ def get_nearest_expiry():
         return get_weekly_expiry_fallback()
 
 
+def reslice_strikes(strikes, atm, radius=3):
+    """
+    FIX A2: Extracts strikes within atm±(radius*50) from a (possibly
+    wider) strikes dict, normalizing keys to int along the way.
+
+    Two separate problems this solves:
+    (a) JSON-gotcha: once a strikes dict has been through Redis
+        (json.dumps/loads), its keys become STRINGS ("24500", not
+        24500) — every `strikes.get(int_strike)` lookup on a reloaded
+        snapshot would silently return None without this normalization.
+    (b) ATM drift: a snapshot saved when ATM was e.g. 24500 (with a
+        wide ATM±8 stored range) can still be resliced around a NEW
+        current ATM (e.g. 24550) as long as there's strike overlap —
+        this is what keeps cross-tick OI-change comparisons valid
+        after price has moved the ATM strike.
+
+    Returns {} (falsy) if nothing in `strikes` falls in the target
+    range — callers should treat that as "N/A", not zero.
+    """
+    if not strikes:
+        return {}
+    target = {atm + (i * 50) for i in range(-radius, radius + 1)}
+    result = {}
+    for k, v in strikes.items():
+        try:
+            sp = int(k)
+        except (TypeError, ValueError):
+            continue
+        if sp in target:
+            result[sp] = v
+    return result
+
+
 def fetch_oi_chain(ltp):
     """
-    Fetch ATM ± 3 strikes OI + volume from Upstox.
-    Nifty strike gap = 50 pts → 7 strikes total.
-    Returns compact dict or None.
+    FIX A1: Dual-range fetch. Upstox is queried once, but strikes are
+    STORED wide (ATM±8, 17 strikes) so a later reslice (see
+    reslice_strikes) can still find useful overlap even if ATM has
+    drifted by the time we look back at this snapshot. The CURRENT-tick
+    aggregates (tot_ce_oi/tot_pe_oi/pcr/walls) are still computed from
+    the narrow ATM±3 window only — unchanged from before — reslicing is
+    what lets PAST snapshots stay comparable after an ATM shift, not a
+    change to what "current" means.
     """
     try:
         atm    = round(ltp / 50) * 50
@@ -359,38 +415,45 @@ def fetch_oi_chain(ltp):
             log.warning("OI chain fetch failed")
             return None
 
-        target = {atm + (i * 50) for i in range(-3, 4)}
-        strikes = {}
+        wide_target = {atm + (i * 50) for i in range(-8, 9)}
+        strikes_wide = {}
 
         for opt in resp:
             sp = int(opt.get("strike_price", 0))
-            if sp not in target:
+            if sp not in wide_target:
                 continue
             ce = opt.get("call_options", {}).get("market_data", {})
             pe = opt.get("put_options",  {}).get("market_data", {})
-            strikes[sp] = {
+            strikes_wide[sp] = {
                 "ce_oi":  int(ce.get("oi",     0)),
                 "pe_oi":  int(pe.get("oi",     0)),
                 "ce_vol": int(ce.get("volume", 0)),
                 "pe_vol": int(pe.get("volume", 0)),
             }
 
-        if not strikes:
+        if not strikes_wide:
             log.warning(f"OI: no strikes found for ATM {atm}")
             return None
 
-        tot_ce_oi  = sum(v["ce_oi"]  for v in strikes.values())
-        tot_pe_oi  = sum(v["pe_oi"]  for v in strikes.values())
-        tot_ce_vol = sum(v["ce_vol"] for v in strikes.values())
-        tot_pe_vol = sum(v["pe_vol"] for v in strikes.values())
+        # Narrow ATM±3 slice — same window as before — for current-tick
+        # aggregates, so existing behavior (totals/PCR/walls) is unchanged.
+        narrow = reslice_strikes(strikes_wide, atm, radius=3)
+        if not narrow:
+            log.warning(f"OI: narrow ATM±3 reslice empty for ATM {atm}")
+            return None
+
+        tot_ce_oi  = sum(v["ce_oi"]  for v in narrow.values())
+        tot_pe_oi  = sum(v["pe_oi"]  for v in narrow.values())
+        tot_ce_vol = sum(v["ce_vol"] for v in narrow.values())
+        tot_pe_vol = sum(v["pe_vol"] for v in narrow.values())
         pcr        = round(tot_pe_oi / tot_ce_oi, 3) if tot_ce_oi > 0 else 1.0
-        ce_wall    = max(strikes, key=lambda s: strikes[s]["ce_oi"])
-        pe_wall    = max(strikes, key=lambda s: strikes[s]["pe_oi"])
+        ce_wall    = max(narrow, key=lambda s: narrow[s]["ce_oi"])
+        pe_wall    = max(narrow, key=lambda s: narrow[s]["pe_oi"])
 
         return {
             "atm":         atm,
             "expiry":      expiry,
-            "strikes":     strikes,
+            "strikes":     strikes_wide,   # FIX A1: wide (ATM±8) for storage/reslice
             "tot_ce_oi":   tot_ce_oi,
             "tot_pe_oi":   tot_pe_oi,
             "tot_ce_vol":  tot_ce_vol,
@@ -405,19 +468,35 @@ def fetch_oi_chain(ltp):
 
 
 def save_oi_snapshot(data):
-    """Save OI snapshot keyed by current 5-min slot"""
+    """
+    FIX D1+E1+E2: Redis key now date-namespaced (oi:{date}:{HH:MM})
+    instead of the old oi:{HH:MM}. Previously the SAME key (e.g.
+    "oi:13:14") got silently overwritten by tomorrow's 13:14 snapshot —
+    harmless at the old 2hr TTL, but it meant the TTL could never
+    safely be raised without risking a stale day's data being read as
+    "today's". With the date now in the key, TTL can go to 7 days
+    (useful for future yesterday-lookups) without that collision risk.
+    """
     now  = datetime.now(IST)
+    date = now.strftime("%Y-%m-%d")
     slot = now.strftime("%H:%M")
-    _set(f"oi:{slot}", data, ttl=7200)
+    _set(f"oi:{date}:{slot}", data, ttl=7 * 86400)
     log.info(f"OI snapshot saved: {slot} | PCR:{data.get('pcr')}")
 
 
 def get_oi_snapshot(minutes_ago):
-    """Retrieve OI snapshot from N minutes ago (rounded to 5min)"""
+    """
+    Retrieve OI snapshot from N minutes ago (rounded to 5min).
+    FIX D1+E1+E2: date-aware key lookup — computes the snapshot's own
+    date (not just time), so this stays correct even in the rare case
+    the lookback window crosses midnight.
+    """
     past = datetime.now(IST) - timedelta(minutes=minutes_ago)
     rounded = (past.minute // 5) * 5
-    slot = past.replace(minute=rounded, second=0).strftime("%H:%M")
-    return _get(f"oi:{slot}")
+    past = past.replace(minute=rounded, second=0, microsecond=0)
+    date = past.strftime("%Y-%m-%d")
+    slot = past.strftime("%H:%M")
+    return _get(f"oi:{date}:{slot}")
 
 
 def _fmt_chg(past_data, key):
@@ -481,18 +560,49 @@ def format_oi_context(current):
     past5_ce_vol = past5.get("tot_ce_vol") if past5 else None
     past5_pe_vol = past5.get("tot_pe_vol") if past5 else None
 
+    current_atm = current["atm"]
+
+    # FIX A3/A4: recompute past CE/PE OI + PCR by RESLICING the past
+    # snapshot's stored (wide, ATM±8) strikes around the CURRENT atm —
+    # instead of trusting the past snapshot's own tot_ce_oi/pcr fields
+    # (which were computed around whatever ATM was current back then).
+    # If ATM hasn't moved between the two ticks, this returns the exact
+    # same numbers as before. If ATM HAS moved, this is what keeps the
+    # comparison apples-to-apples instead of silently diffing two
+    # different strike windows.
     chg = {}
+    past5_resliced = {}
     for mins in [5, 15, 30]:
         past = get_oi_snapshot(mins)
-        if past and past.get("tot_ce_oi", 0) > 0:
+        if not past or not past.get("strikes"):
+            chg[mins] = None
+            continue
+
+        resliced = reslice_strikes(past["strikes"], current_atm, radius=3)
+
+        # FIX A5: if the past snapshot's stored ATM±8 window doesn't
+        # overlap today's current ATM at all (ATM drifted >250pts —
+        # well beyond the stored range), don't silently compute a
+        # partial/misleading number. Mark this leg N/A instead.
+        atm_shift = abs(past.get("atm", current_atm) - current_atm)
+        if not resliced or atm_shift > 250:
+            chg[mins] = None
+            continue
+
+        if mins == 5:
+            past5_resliced = resliced
+
+        past_ce_oi = sum(v.get("ce_oi", 0) for v in resliced.values())
+        past_pe_oi = sum(v.get("pe_oi", 0) for v in resliced.values())
+
+        if past_ce_oi > 0 and past_pe_oi >= 0:
             chg[mins] = {
-                "ce_chg": round(
-                    (current["tot_ce_oi"] - past["tot_ce_oi"])
-                    / past["tot_ce_oi"] * 100, 1),
-                "pe_chg": round(
-                    (current["tot_pe_oi"] - past["tot_pe_oi"])
-                    / past["tot_pe_oi"] * 100, 1),
-                "pcr": past.get("pcr"),
+                "ce_chg": round((current["tot_ce_oi"] - past_ce_oi) / past_ce_oi * 100, 1),
+                "pe_chg": (
+                    round((current["tot_pe_oi"] - past_pe_oi) / past_pe_oi * 100, 1)
+                    if past_pe_oi > 0 else None
+                ),
+                "pcr": round(past_pe_oi / past_ce_oi, 3),
             }
         else:
             chg[mins] = None
@@ -518,6 +628,12 @@ def format_oi_context(current):
     cw_oi = current["strikes"].get(current["ce_wall"], {}).get("ce_oi", 0)
     pw_oi = current["strikes"].get(current["pe_wall"], {}).get("pe_oi", 0)
 
+    # FIX B1: absolute OI change (in lakhs) specifically AT the wall
+    # strikes over the last 5min — not a ratio like PCR, a plain "how
+    # many more/fewer contracts written here" number, floor-filtered so
+    # tiny noise doesn't get reported as a real move.
+    wall_chg_str = _wall_change_str(current, past5_resliced)
+
     return (
         f"[OI | ATM:{current['atm']} | {current.get('expiry', get_nearest_expiry())}]\n"
         f"PCR:{pcr_str}\n"
@@ -525,10 +641,37 @@ def format_oi_context(current):
         f"PE_OI_CHG:{pe_chg_str}\n"
         f"CE_WALL:{current['ce_wall']}({cw_oi//100000:.1f}L) "
         f"PE_WALL:{current['pe_wall']}({pw_oi//100000:.1f}L)\n"
+        f"{wall_chg_str}\n"
         f"CE_VOL:{_vol_label(current['tot_ce_vol'], past5_ce_vol, base_ce_vol, elapsed_min)} "
         f"PE_VOL:{_vol_label(current['tot_pe_vol'], past5_pe_vol, base_pe_vol, elapsed_min)} "
         f"(vs 5min-ago, relative to today's avg pace)"
     )
+
+
+def _wall_change_str(current, past5_resliced):
+    """
+    FIX B1: Absolute OI change (lakhs) at the CE_WALL / PE_WALL strikes
+    specifically, floor-filtered at ±0.3L (below that = reported as
+    flat 0.0L, treated as noise not a real add/unwind).
+    """
+    ce_wall = current["ce_wall"]
+    pe_wall = current["pe_wall"]
+
+    def _delta_lakh(strike, side_key):
+        if not past5_resliced or strike not in past5_resliced:
+            return None
+        past_oi = past5_resliced[strike].get(side_key, 0)
+        cur_oi  = current["strikes"].get(strike, {}).get(side_key, 0)
+        delta   = (cur_oi - past_oi) / 100000
+        return 0.0 if abs(delta) < 0.3 else round(delta, 1)
+
+    ce_delta = _delta_lakh(ce_wall, "ce_oi")
+    pe_delta = _delta_lakh(pe_wall, "pe_oi")
+
+    ce_str = f"{ce_delta:+.1f}L" if ce_delta is not None else "N/A"
+    pe_str = f"{pe_delta:+.1f}L" if pe_delta is not None else "N/A"
+
+    return f"CE_WALL_CHG:{ce_str} | PE_WALL_CHG:{pe_str} (5min, absolute not ratio)"
 
 
 # ═══════════════════════════════════════════════════════
@@ -1457,6 +1600,11 @@ DATA MEANING:
 - PE_OI_CHG: PE open interest change % (positive = fresh put writing = bearish hedge)
 - CE_WALL: Strike with highest CE OI (resistance — sellers protecting this level)
 - PE_WALL: Strike with highest PE OI (support — sellers protecting this level)
+- CE_WALL_CHG/PE_WALL_CHG: absolute OI change (in LAKHS, not a ratio)
+  specifically at the wall strikes over the last 5min. A wall GROWING
+  (+ve) = that side actively reinforcing the level. A wall SHRINKING
+  (-ve, i.e. unwinding) = that side losing conviction — often precedes
+  the wall actually breaking. N/A means no comparable snapshot yet.
 - CE_VOL/PE_VOL: Volume vs morning baseline (HIGH = active directional buying)
 
 SIGNAL RULES:
