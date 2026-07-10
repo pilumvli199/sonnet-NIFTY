@@ -65,6 +65,12 @@
 ║           (oi:{date}:{HH:MM}), TTL raised to 7 days   ║
 ║           for OI keys only (zones/context untouched, ║
 ║           still flushed daily as before)             ║
+║  FIX 24 : Zone-history awareness — signal_history now ║
+║           stores zone_low/zone_high (matched by price ║
+║           overlap, not reused AI zone-ids). Past      ║
+║           BUY_CE/BUY_PE + result at the SAME price    ║
+║           level today is now shown to the AI as       ║
+║           factual [ZONE HISTORY] context              ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -1075,6 +1081,66 @@ def save_signal_log(entry):
     _set("signal_history", h)
 
 
+def _zone_overlap_ratio(a_low, a_high, b_low, b_high):
+    """Shared overlap-ratio helper (same style as merge_zones' internal
+    overlap()) — fraction of zone A's width that overlaps zone B."""
+    ol = max(0, min(a_high, b_high) - max(a_low, b_low))
+    span_a = max(a_high - a_low, 1)
+    return ol / span_a
+
+
+def get_zone_history(zone, overlap_threshold=0.5):
+    """
+    FIX 24 (zone-history awareness): Looks through TODAY's signal_history
+    for past BUY_CE/BUY_PE entries whose zone price range overlaps this
+    `zone` by >= overlap_threshold. Matches by PRICE OVERLAP, not by
+    zone_id — because the AI reassigns ids like "S1"/"R1" fresh on every
+    hourly reanalysis, so the same id can point at a completely
+    different price level later in the day. Price overlap is what
+    actually identifies "the same level" reliably.
+
+    Returns a list of matching signal_history entries (each with time,
+    signal, result) — oldest first, or [] if this level hasn't been
+    signaled on yet today.
+    """
+    zone_low  = zone.get("low", 0)
+    zone_high = zone.get("high", 0)
+    if zone_high <= zone_low:
+        return []
+
+    matches = []
+    for entry in get_signal_history():
+        if entry.get("signal") not in ("BUY_CE", "BUY_PE"):
+            continue
+        e_low  = entry.get("zone_low")
+        e_high = entry.get("zone_high")
+        if e_low is None or e_high is None:
+            continue
+        if _zone_overlap_ratio(zone_low, zone_high, e_low, e_high) >= overlap_threshold:
+            matches.append(entry)
+    return matches
+
+
+def _zone_history_block(matches):
+    """
+    FIX 24: Formats get_zone_history() results into a factual prompt
+    block. No "should WAIT" instruction here — that's stated once in
+    ZONE_DECISION_SYSTEM instead. This is deliberately just the facts
+    (same principle as _dominance_block / _structure_shift_block):
+    Python reports what happened, the AI weighs it.
+    """
+    if not matches:
+        return ""
+    lines = [f"{m.get('time','?')} {m.get('signal','?')} → {m.get('result','?')}" for m in matches]
+    tgt_hits = sum(1 for m in matches if m.get("result") == "REF_TARGET_HIT")
+    sl_hits  = sum(1 for m in matches if m.get("result") == "REF_SL_HIT")
+    return (
+        f"\n\n[ZONE HISTORY — today, this price level]\n"
+        f"Signaled {len(matches)}x already today: " + "; ".join(lines) + "\n"
+        f"({tgt_hits} target-hit, {sl_hits} SL-hit so far)"
+    )
+
+
 def save_ai_raw_log(entry):
     logs = _get("ai_raw_log") or []
     logs.append(entry)
@@ -1783,6 +1849,22 @@ BIAS FRESHNESS (read this carefully):
   has already detected multiple zones breaking in the same new
   direction since the bias was last computed.
 
+ZONE HISTORY (if a [ZONE HISTORY] block is present below):
+- This shows past BUY_CE/BUY_PE signals TODAY at this same price
+  level (matched by price overlap, not by zone label — the same
+  price level can carry different ids after hourly reanalysis).
+- Repeated REF_SL_HIT at this level = the level may be weakening or
+  getting exhausted — raise the bar for confidence on a repeat signal
+  here; do not fire on the same quality of setup that already failed
+  without something genuinely different this time (e.g. much stronger
+  candle, fresh OI confluence not present before).
+- Repeated REF_TARGET_HIT at this level = the level has demonstrated
+  real edge today — this supports (does not guarantee) confidence on
+  a fresh valid setup here.
+- An OPEN result means a prior signal here hasn't resolved yet —
+  treat a brand new signal at the same level with extra caution to
+  avoid stacking correlated risk.
+
 CHoCH RULE:
 Bullish: price swept below support → reclaimed above → minor lower-high broken
 → BUY_CE if last completed 5M close confirms reclaim.
@@ -1941,6 +2023,8 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
     context_zones = get_context_zones(ltp, all_zones)
     # FIX 20: real-time structure-shift fact, independent of hourly bias
     structure_shift = get_structure_shift()
+    # FIX 24: has THIS price level already fired signals today?
+    zone_history = get_zone_history(touched_zone)
 
     data_str = build_zone_decision_string(
         tf_data, ltp, touched_zone, all_zones, morning_ctx,
@@ -1951,7 +2035,8 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
     if event and event != "NO_EVENT":
         event_block = f"\n\n[DETECTED CANDLE EVENT]\nEvent: {event}\nDetail: {event_reason}"
 
-    shift_block = _structure_shift_block(structure_shift)
+    shift_block   = _structure_shift_block(structure_shift)
+    history_block = _zone_history_block(zone_history)
 
     situation_module = PROMPT_MODULES.get(event, "")
     system_prompt    = ZONE_DECISION_SYSTEM
@@ -1965,7 +2050,7 @@ def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx,
         if event in PCR_REVERSAL_EVENTS:
             system_prompt += f"\n\n{PCR_CONFLUENCE_MODULE}"
 
-    user_prompt = data_str + event_block + shift_block + """
+    user_prompt = data_str + event_block + shift_block + history_block + """
 
 RETURN ONLY this JSON:
 {
@@ -2509,6 +2594,8 @@ def zone_monitor_job():
             save_signal_log({
                 "time":       now.strftime("%H:%M"),
                 "zone_id":    zone_id,
+                "zone_low":   updated_zone.get("low"),
+                "zone_high":  updated_zone.get("high"),
                 "event":      event,
                 "signal":     "REJECTED",
                 "confidence": result.get("confidence"),
@@ -2526,6 +2613,8 @@ def zone_monitor_job():
         save_signal_log({
             "time":       now.strftime("%H:%M"),
             "zone_id":    zone_id,
+            "zone_low":   updated_zone.get("low"),
+            "zone_high":  updated_zone.get("high"),
             "event":      event,
             "signal":     sig,
             "confidence": result.get("confidence"),
