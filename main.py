@@ -159,38 +159,63 @@ def _register(scheduler, store, *, enabled, module, func_name, tag, job_id, gate
         scheduler.add_job(_guarded(tag, fn, gate, run_async=run_async), "cron", args=[store], id=job_id, **cron)
     log.info(f"✅ Scheduled [{tag}] {label}")
 
-# ─── SYSTEM HEALTH CHECK ENGINE ───
+# ─── SYSTEM HEALTH CHECK ENGINE (FIXED) ───
 def run_health_check():
     log.info("[SYSTEM] 🏥 Running Health Check & API Validations...")
     res = {"Delta": "❌", "Upstox": "❌", "Gemini": "❌", "Claude": "❌"}
     
+    # 1. Delta Exchange Check (Tickers endpoint - start/end timestamps chi garaj nahi)
     try:
-        if requests.get("https://api.india.delta.exchange/v2/history/candles?symbol=BTCUSD&resolution=1m", timeout=10).status_code == 200:
+        d_key = os.getenv("DELTA_API_KEY", "").strip()
+        d_headers = {"api-key": d_key} if d_key else {}
+        r_delta = requests.get("https://api.india.delta.exchange/v2/tickers/BTCUSD", headers=d_headers, timeout=10)
+        if r_delta.status_code == 200 and r_delta.json().get("success"):
             res["Delta"] = "✅ OK"
-    except Exception: pass
+        else:
+            r_fb = requests.get("https://api.india.delta.exchange/v2/products/BTCUSD", headers=d_headers, timeout=10)
+            if r_fb.status_code == 200:
+                res["Delta"] = "✅ OK"
+    except Exception as e:
+        log.warning(f"[HEALTH] Delta check failed: {e}")
 
+    # 2. Upstox Check
     try:
-        u_token = os.getenv("UPSTOX_ANALYTICS_TOKEN")
+        u_token = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
         if u_token:
             hdrs = {"Authorization": f"Bearer {u_token}", "Accept": "application/json"}
             if requests.get("https://api.upstox.com/v3/market-quote/ltp?instrument_key=NSE_INDEX|Nifty 50", headers=hdrs, timeout=10).status_code == 200:
                 res["Upstox"] = "✅ OK"
-    except Exception: pass
+    except Exception as e:
+        log.warning(f"[HEALTH] Upstox check failed: {e}")
 
+    # 3. Gemini Check (Tujhya screenshot nusar gemini-3.1-flash-lite vaparel)
     try:
         g_keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",") if k.strip()]
+        g_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
         if g_keys:
-            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={g_keys[0]}", json={"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}, timeout=10)
-            if r.status_code == 200: res["Gemini"] = "✅ OK"
-    except Exception: pass
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={g_keys[0]}"
+            payload = {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}
+            r_gem = requests.post(url, json=payload, timeout=10)
+            if r_gem.status_code == 200:
+                res["Gemini"] = "✅ OK"
+            else:
+                log.warning(f"[HEALTH] Gemini ping returned {r_gem.status_code}: {r_gem.text[:120]}")
+    except Exception as e:
+        log.warning(f"[HEALTH] Gemini check failed: {e}")
 
+    # 4. Claude Check (Optional)
     try:
-        a_key = os.getenv("ANTHROPIC_API_KEY")
+        a_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        c_model = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-4-5-20251001").strip()
         if a_key:
             hdrs = {"x-api-key": a_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-            r = requests.post("https://api.anthropic.com/v1/messages", headers=hdrs, json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "Hi"}]}, timeout=10)
-            if r.status_code == 200: res["Claude"] = "✅ OK"
-    except Exception: pass
+            r_claude = requests.post("https://api.anthropic.com/v1/messages", headers=hdrs, json={"model": c_model, "max_tokens": 10, "messages": [{"role": "user", "content": "Hi"}]}, timeout=10)
+            if r_claude.status_code == 200:
+                res["Claude"] = "✅ OK"
+        else:
+            res["Claude"] = "⚪ Not Set (Optional)"
+    except Exception as e:
+        log.warning(f"[HEALTH] Claude check failed: {e}")
 
     msg = (f"🏥 <b>[SYSTEM HEALTH CHECK PASS]</b>\n\n"
            f"<b>Upstox Data :</b> {res['Upstox']}\n"
