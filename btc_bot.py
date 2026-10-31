@@ -15,9 +15,8 @@
 ║   • Closed-Candle Guard: Ignores running candle (Zero Repainting/Flicker)║
 ║   • Dynamic ATR Range: Replaces static $450 with 3.0x ATR search window  ║
 ║   • 30M 50 EMA Slope & Structure: Prevents fighting macro momentum       ║
-║   • Diagnostic Self-Test on Startup: Pings Delta, AI, Telegram, Server   ║
-║   • Daily 09:15 AM IST System Audit Card: Sent to Telegram automatically ║
-║   • 6-Hour Macro Re-analysis: Logs & updates zones at 05:30, 11:30, etc. ║
+║   • Delta API Key & Secret Header integration included                   ║
+║   • Gemini Free Tier Anti-Ban: 5.0s Delay (<= 12 RPM) + 429 Auto-Retry   ║
 ║   • Built-in HTTP Health Server (Port 8080 / $PORT) for UptimeRobot      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
@@ -47,11 +46,13 @@ TG_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID          = os.getenv("BTC_TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
 
 DELTA_BASE_URL      = os.getenv("DELTA_BASE_URL", "https://api.india.delta.exchange")
+DELTA_API_KEY       = os.getenv("DELTA_API_KEY", "").strip()
+DELTA_API_SECRET    = os.getenv("DELTA_API_SECRET", "").strip()
 BTC_SYMBOL          = os.getenv("BTC_SYMBOL", "BTCUSD")
 PORT                = int(os.getenv("PORT", "8080"))
 WAIT_COOLDOWN_MIN   = int(os.getenv("BTC_WAIT_COOLDOWN_MIN", "15"))
 SIGNAL_COOLDOWN_MIN = int(os.getenv("BTC_SIGNAL_COOLDOWN_MIN", "240"))  # 4 Hours Cooldown
-GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 CLAUDE_BACKUP_MODEL = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-4-5-20251001")
 
 _btc_lock = threading.Lock()
@@ -188,7 +189,7 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
 
 
 # ==============================================================================
-# DELTA EXCHANGE PUBLIC API CANDLES (WITH UNCLOSED CANDLE GUARD)
+# DELTA EXCHANGE PUBLIC/PRIVATE API CANDLES
 # ==============================================================================
 def fetch_delta_candles(symbol: str, resolution: str, hours_back: int, closed_only: bool = True):
     end_ts = int(time.time())
@@ -197,8 +198,12 @@ def fetch_delta_candles(symbol: str, resolution: str, hours_back: int, closed_on
     params = {"symbol": symbol, "resolution": resolution, "start": start_ts, "end": end_ts}
     res_sec = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}.get(resolution, 1800)
 
+    headers = {}
+    if DELTA_API_KEY:
+        headers["api-key"] = DELTA_API_KEY
+
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, headers=headers, timeout=15)
         if r.status_code == 200:
             res = r.json().get("result", [])
             if not res:
@@ -210,7 +215,6 @@ def fetch_delta_candles(symbol: str, resolution: str, hours_back: int, closed_on
             df[["o", "h", "l", "c"]] = df[["o", "h", "l", "c"]].astype(float).round(1)
             df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
 
-            # Drop currently forming (unclosed) candle so we never trigger on unclosed wicks
             if closed_only and not df.empty:
                 last_open_ts = int(df.iloc[-1]["time"])
                 if end_ts < (last_open_ts + res_sec):
@@ -742,7 +746,6 @@ def check_6h_macro_reanalysis(state: BtcState, df_30m: pd.DataFrame):
     global _last_macro_reanalysis_slot
     now = datetime.now(IST)
 
-    # 4 slots per day in IST: (5, 30), (11, 30), (17, 30), (23, 30)
     slot_hours = [5, 11, 17, 23]
     cur_slot = None
     for h in slot_hours:
@@ -778,7 +781,7 @@ def run_btc_cycle(shared_store=None):
             return
 
         df_30m = compute_indicators(df_30m)
-        ltp = float(df_30m.iloc[-1]["c"])
+        ltp = float(df_30m["c"].iloc[-1])
         last_bar_time = int(df_30m.iloc[-1]["time"])
 
         # Routine checks: 6H Macro and Daily 09:15
@@ -897,7 +900,6 @@ def run_btc_cycle(shared_store=None):
             pass
 
 
-
 def run_6h_analysis(shared_store=None):
     """
     6-Hour Macro Re-analysis for Bitcoin (BTCUSD).
@@ -992,7 +994,6 @@ def run_btc_30m_tick(shared_store=None):
 def run_btc_1m_tick(shared_store=None):
     """Backward compatibility alias for 1m schedulers."""
     run_btc_cycle(shared_store)
-
 
 
 # ==============================================================================
