@@ -1,4 +1,4 @@
-"""
+""
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║   MASTER ORCHESTRATOR (main.py) — NIFTY 50 + BITCOIN + GOLD V7.5         ║
 ║   Multi-Asset Launcher for Koyeb / Docker / Cloud (High-Precision Async) ║
@@ -64,7 +64,27 @@ def is_nifty_open(now=None) -> bool:
 
 def is_gold_open(now=None) -> bool:
     now = now or datetime.now(IST)
-    return now.weekday() < 5
+    weekday = now.weekday()  # 0=Mon, 1=Tue, ..., 5=Sat, 6=Sun
+    t_min = now.hour * 60 + now.minute
+
+    # Sunday: Closed all day
+    if weekday == 6:
+        return False
+
+    # Saturday: Closes at 02:30 AM IST (Summer EDT) / 03:30 AM IST (Winter EST)
+    if weekday == 5:
+        return t_min < (2 * 60 + 30)
+
+    # Monday: Opens at 03:30 AM IST (Summer EDT) / 04:30 AM IST (Winter EST)
+    if weekday == 0:
+        return t_min >= (3 * 60 + 30)
+
+    # Tue-Fri: Daily 1-hour rollover maintenance break (02:30 - 03:30 AM IST)
+    if 1 <= weekday <= 4:
+        if (2 * 60 + 30) <= t_min < (3 * 60 + 30):
+            return False
+
+    return True
 
 def is_btc_open(now=None) -> bool:
     return True
@@ -159,12 +179,12 @@ def _register(scheduler, store, *, enabled, module, func_name, tag, job_id, gate
         scheduler.add_job(_guarded(tag, fn, gate, run_async=run_async), "cron", args=[store], id=job_id, **cron)
     log.info(f"✅ Scheduled [{tag}] {label}")
 
-# ─── SYSTEM HEALTH CHECK ENGINE (FIXED) ───
+# ─── SYSTEM HEALTH CHECK ENGINE ───
 def run_health_check():
     log.info("[SYSTEM] 🏥 Running Health Check & API Validations...")
     res = {"Delta": "❌", "Upstox": "❌", "Gemini": "❌", "Claude": "❌"}
     
-    # 1. Delta Exchange Check (Tickers endpoint - start/end timestamps chi garaj nahi)
+    # 1. Delta Exchange Health Check (Tickers endpoint - no start/end required)
     try:
         d_key = os.getenv("DELTA_API_KEY", "").strip()
         d_headers = {"api-key": d_key} if d_key else {}
@@ -178,7 +198,7 @@ def run_health_check():
     except Exception as e:
         log.warning(f"[HEALTH] Delta check failed: {e}")
 
-    # 2. Upstox Check
+    # 2. Upstox Health Check
     try:
         u_token = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
         if u_token:
@@ -188,7 +208,7 @@ def run_health_check():
     except Exception as e:
         log.warning(f"[HEALTH] Upstox check failed: {e}")
 
-    # 3. Gemini Check (Tujhya screenshot nusar gemini-3.1-flash-lite vaparel)
+    # 3. Gemini AI Health Check (Uses active model from env, e.g., gemini-3.1-flash-lite)
     try:
         g_keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",") if k.strip()]
         g_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
@@ -203,7 +223,7 @@ def run_health_check():
     except Exception as e:
         log.warning(f"[HEALTH] Gemini check failed: {e}")
 
-    # 4. Claude Check (Optional)
+    # 4. Claude AI Backup Check (Optional)
     try:
         a_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         c_model = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-4-5-20251001").strip()
@@ -227,8 +247,10 @@ def run_health_check():
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
     tg_chat = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("BTC_TELEGRAM_CHAT_ID")
     if tg_token and tg_chat:
-        try: requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={"chat_id": tg_chat, "text": msg, "parse_mode": "HTML"}, timeout=10)
-        except Exception: pass
+        try:
+            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={"chat_id": tg_chat, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        except Exception as e:
+            log.error(f"[HEALTH] Telegram alert failed: {e}")
 
 
 def main():
@@ -258,8 +280,8 @@ def main():
         _register(scheduler, store, enabled=ENABLE_BTC, module=btc_bot, func_name="run_6h_analysis", tag="BTC", job_id="btc_6h_ai", gate=is_btc_open, label="6-Hour Macro Re-analysis (00,06,12,18)", hour="0,6,12,18", minute=1, second=0)
 
         # 3. GOLD: 30-Minute Closed Bar Scan + 6-Hour Macro Reanalysis (Mon-Fri)
-        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_gold_1m_tick", tag="GOLD", job_id="gold_30m_engine", gate=is_gold_open, label="30-Minute Closed Bar Scan (Mon-Fri)", day_of_week="mon-fri", minute="0,30", second=35)
-        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_6h_analysis", tag="GOLD", job_id="gold_6h_ai", gate=is_gold_open, label="6-Hour Macro Re-analysis (00,06,12,18)", day_of_week="mon-fri", hour="0,6,12,18", minute=2, second=0)
+        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_gold_1m_tick", tag="GOLD", job_id="gold_30m_engine", gate=is_gold_open, label="30-Minute Closed Bar Scan (Mon-Sat 02:30 AM)", day_of_week="mon-sat", minute="0,30", second=35)
+        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_6h_analysis", tag="GOLD", job_id="gold_6h_ai", gate=is_gold_open, label="6-Hour Macro Re-analysis (00,06,12,18)", day_of_week="mon-sat", hour="0,6,12,18", minute=2, second=0)
 
         scheduler.start()
 
