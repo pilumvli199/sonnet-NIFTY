@@ -103,37 +103,15 @@ DOMINANCE_LOOKBACK     = int(os.getenv("NIFTY_DOMINANCE_LOOKBACK", "15"))
 REF_SL_BUFFER          = int(os.getenv("NIFTY_REF_SL_BUFFER", "8"))
 REF_TARGET_FALLBACK    = int(os.getenv("NIFTY_REF_TARGET_FALLBACK", "65"))
 OPTION_LOOKBACK        = int(os.getenv("NIFTY_OPTION_LOOKBACK", "20"))
-# BUGFIX v8 (1 Nov 2026, data-validated over 10-month 1-min backtest): was "38", but
-# ZONE_DECISION_SYSTEM's own prompt text always told the AI ">35 pts = WAIT". Python allowed
-# up to 38, AI was instructed to reject anything past 35 -> ~1.8% of valid sweeps (44 over
-# 10 months) got inconsistent treatment between the two layers. Synced both to 35.
-MAX_INDEX_CHASE_PTS    = int(os.getenv("NIFTY_MAX_INDEX_CHASE_PTS", "35"))
+MAX_INDEX_CHASE_PTS    = int(os.getenv("NIFTY_MAX_INDEX_CHASE_PTS", "38"))
 MAX_OPTION_RISK_PTS    = float(os.getenv("NIFTY_MAX_OPTION_RISK_PTS", "15.0"))  # Real SL guard, never clamped!
-
-# ── EXPERIMENTAL (v8.1, opt-in, OFF by default): S3 1-Minute Sideways Variant ──────────
-# Backtest (10-month 1-min NIFTY data, box recomputed every 1-min candle) note: with the
-# scaled constants below, this 1M variant currently performs WORSE than the production 5M S3
-# (22.7% WR / -0.212R resolved expectancy vs production's 33.9% WR / -0.096R). Kept OFF by
-# default; exists only as a separately-tagged (S3_1M_*) parallel signal for manual comparison,
-# per Yellow Flash v8/v8.1 review. [v8.1: fixed a bug where the live 1M box was only refreshed
-# on 5-min boundaries instead of every eligible 1-min scan -- see update_live_s3_1m_box(). The
-# backtest numbers above were already computed assuming the correct every-1-min refresh, so
-# they are unaffected by that fix and remain the current reference figures.]
-ENABLE_S3_1M_EXPERIMENTAL      = os.getenv("NIFTY_ENABLE_S3_1M_EXPERIMENTAL", "false").lower() == "true"
-S3_1M_BOX_MIN_PTS              = int(os.getenv("NIFTY_S3_1M_BOX_MIN_PTS", "2"))     # literal rulebook "2-10pt" range
-S3_1M_BOX_MAX_PTS              = int(os.getenv("NIFTY_S3_1M_BOX_MAX_PTS", "10"))
-S3_1M_MICRO_BODY_MAX_PTS       = int(os.getenv("NIFTY_S3_1M_MICRO_BODY_MAX_PTS", "3"))      # scaled from 5M's 6 (~0.42 amplitude ratio)
-S3_1M_MICRO_BOUNDARY_BUF_PTS   = int(os.getenv("NIFTY_S3_1M_MICRO_BOUNDARY_BUF_PTS", "3"))  # scaled from 5M's 8
-S3_1M_MICRO_EXPANSION_MIN_PTS  = int(os.getenv("NIFTY_S3_1M_MICRO_EXPANSION_MIN_PTS", "4")) # scaled from 5M's 10
 
 # ── Watchdog & Holidays ──────────────────────────────────────────────
 FEED_FAIL_ALERT_AFTER  = int(os.getenv("FEED_FAIL_ALERT_AFTER", "3"))
 NSE_HOLIDAYS           = {d.strip() for d in os.getenv("NSE_HOLIDAYS", "").split(",") if d.strip()}
 
 # ── AI Models ────────────────────────────────────────────────────────
-# v8.1: "gemini-2.5-flash" was retired; switched default to "gemini-3.1-flash-lite"
-# (confirmed live at ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite).
-GEMINI_MODEL              = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL              = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ANALYSIS_CLAUDE_MODEL     = os.getenv("ANALYSIS_MODEL", "claude-sonnet-4-6")
 DECISION_CLAUDE_MODEL     = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-4-5-20251001")
 FIRST_ANALYSIS_MAX_TOKENS = int(os.getenv("FIRST_ANALYSIS_MAX_TOKENS", "2600"))
@@ -286,7 +264,7 @@ def mark_zone_cooldown(state: NiftyState, zone_id, signal_type, custom_mins=None
 
 def flush_day(state: NiftyState):
     for k in ["zones", "zones_date", "morning_context", "morning_context_date",
-              "signal_history", "ai_raw_log", "flip_log", "active_s3_box", "active_s3_box_1m", "hist_memory_bank"]:
+              "signal_history", "ai_raw_log", "flip_log", "active_s3_box", "hist_memory_bank"]:
         state.delete(k)
     log.info("[NIFTY] 🧹 Day data flushed")
 
@@ -935,34 +913,6 @@ def update_live_intraday_zones(state: NiftyState, existing_zones, tf_data, ltp):
     return merged
 
 
-def update_live_s3_1m_box(state: NiftyState, tf_data):
-    """
-    EXPERIMENTAL (v8, opt-in via NIFTY_ENABLE_S3_1M_EXPERIMENTAL — OFF by default).
-    Live S3 1-Minute Sideways Compression Box (literal rulebook 2-10pt range on 1M candles).
-    Fully separate state key ("active_s3_box_1m") from the production 5M box
-    (`active_s3_box`, updated inside update_live_intraday_zones() above) -- never touches it.
-
-    BUGFIX (v8.1): this was originally folded into update_live_intraday_zones(), which only
-    runs `if is_5m_boundary`, so the "1-minute" box was stale for up to 4 minutes between
-    5-min boundaries -- defeating the point of a 1-min box. Pulled out as its own function and
-    called on EVERY eligible 1-min scan in run_nifty_1m_tick (whenever tf_data carries fresh
-    m1 candles), not just on 5-min boundaries. No-op entirely when the experimental flag is off.
-    """
-    if not ENABLE_S3_1M_EXPERIMENTAL:
-        return
-    m1_exp = drop_incomplete_candle(tf_data.get("m1", pd.DataFrame()), 1, buffer_sec=4)
-    if m1_exp.empty or len(m1_exp) < SIDEWAYS_MIN_CANDLES + 1:
-        return
-    box1_slice = m1_exp.tail(SIDEWAYS_MIN_CANDLES + 1).iloc[:-1]
-    box1_h, box1_l = int(box1_slice["h"].max()), int(box1_slice["l"].min())
-    box1_rng = box1_h - box1_l
-    if S3_1M_BOX_MIN_PTS <= box1_rng <= S3_1M_BOX_MAX_PTS:
-        state.set("active_s3_box_1m", {
-            "low": box1_l, "high": box1_h, "range": box1_rng,
-            "updated_at": datetime.now(IST).strftime("%H:%M:%S")
-        }, ttl=300)
-
-
 def normalize_zone_types(zones, ltp):
     out = []
     for z in zones:
@@ -1461,15 +1411,6 @@ def evaluate_s3_sideways_setup(state: NiftyState, tf_data, ltp, trend_info):
             }
 
     # Variant B: Micro-Candle Absorption at Box Boundary
-    # REVIEWED v8.1 (code-review question: should this have a symmetric upper-bound/BUY_PE
-    # "buyer exhaustion at box top -> blast down" case?): the Yellow Flash rulebook's S3 text
-    # ("if one side's liquidity is already hunted, take the opposite (unhunted) side...") does
-    # not describe a micro-candle-absorption mechanic at all, on either side -- this whole
-    # Variant B (CE-only, box-bottom) is a code-side addition beyond the literal rulebook text,
-    # not a rulebook-specified pattern with a documented PE counterpart. No evidence was found
-    # either way, so NO symmetric BUY_PE variant was added here (same intentional CE-only
-    # asymmetry preserved in the 1M experimental copy below) -- flag for a rulebook update if a
-    # PE-side mechanic is intended.
     c1, c2, c3 = m5.iloc[-1], m5.iloc[-2], m5.iloc[-3]
     b2 = abs(int(c2["c"]) - int(c2["o"]))
     b3 = abs(int(c3["c"]) - int(c3["o"]))
@@ -1493,109 +1434,6 @@ def evaluate_s3_sideways_setup(state: NiftyState, tf_data, ltp, trend_info):
                 "sweep_detail": f"Tiny absorption candles ({b3}pt, {b2}pt) held at box bottom {box_l} + +{c1_body}pt Green expansion",
                 "option_info": opt_check,
                 "zone_obj": {"id": "S3_BOX", "type": "SIDEWAYS_BOX", "low": box_l, "high": box_h, "pivot": box_l, "strength": "STRONG"},
-            }
-
-    return None
-
-
-def evaluate_s3_1m_sideways_setup(state: NiftyState, tf_data, ltp, trend_info):
-    """
-    EXPERIMENTAL (v8.1, opt-in via NIFTY_ENABLE_S3_1M_EXPERIMENTAL, OFF by default):
-    Same S3 mechanic as evaluate_s3_sideways_setup() above, but the compression box is built
-    from 1-MINUTE candles with the literal Yellow Flash rulebook "2-10pt" range, instead of the
-    production 5M/12-35pt box. Entirely separate state key ("active_s3_box_1m", refreshed by
-    update_live_s3_1m_box() on every eligible 1-min scan) and cooldown key ("S3_1M_BOX") from
-    the production S3 setup above -- does NOT touch or replace it.
-
-    10-month backtest note: with S3_1M_MICRO_* constants scaled down (~0.42x) from the 5M
-    versions, this variant historically underperforms production S3 (22.7% WR / -0.212R
-    resolved expectancy vs 33.9% WR / -0.096R for 5M S3). Kept here purely as a separately
-    tagged (S3_1M_FAKEOUT / S3_1M_MICRO_ABS) parallel alert for manual comparison -- NOT a
-    replacement for the production S3 setup, which is untouched. Same CE-only micro-absorption
-    asymmetry as production (see Variant B comment in evaluate_s3_sideways_setup) -- no
-    rulebook evidence found for a symmetric BUY_PE case, so none was added here either.
-
-    Chase-distance note: like production S3, this setup has NO MAX_INDEX_CHASE_PTS gate --
-    the tiny 2-10pt box width already bounds how far the sweep extreme can be from entry.
-    """
-    box1 = state.get("active_s3_box_1m")
-    if not box1:
-        return None
-    if not zone_cooldown_ok(state, "S3_1M_BOX"):
-        return None
-
-    m1 = drop_incomplete_candle(tf_data.get("m1", pd.DataFrame()), 1, buffer_sec=4)
-    if m1.empty or len(m1) < 6:
-        return None
-
-    box_l, box_h = box1["low"], box1["high"]
-    trend_15m = trend_info.get("trend", "SIDEWAYS")
-
-    swept_dn, ext_dn, pat_dn, sl_dn, det_dn = detect_synthetic_or_single_sweep(m1, box_l, box_h, "BUY_CE", pivot=box_l)
-    if swept_dn and trend_15m != "DOWNTREND":
-        opt_check = analyze_option_chart_confirmation(state, ltp, "BUY_CE")
-        if opt_check.get("confirmed"):
-            return {
-                "status": "TRIGGERED",
-                "setup_code": "S3_1M",
-                "setup_name": "S3 (1M Experimental Fake Breakdown Hunt → Opposite Side Upside)",
-                "action": "BUY_CE",
-                "hunt_side": is_setup_trend_side("BUY_CE", trend_15m),
-                "trigger_tf": "1M",
-                "pattern": "S3_1M_FAKEOUT_RECLAIM",
-                "sweep_extreme": sl_dn,
-                "chase_distance_pts": round(abs(ltp - sl_dn), 1),
-                "index_sl": sl_dn - REF_SL_BUFFER,
-                "sweep_detail": f"[EXPERIMENTAL] 1M Sideways Box ({box_l}-{box_h}) downside liquidity hunted & reclaimed: {det_dn}",
-                "option_info": opt_check,
-                "zone_obj": {"id": "S3_1M_BOX", "type": "SIDEWAYS_BOX", "low": box_l, "high": box_h, "pivot": box_l, "strength": "STRONG"},
-            }
-
-    swept_up, ext_up, pat_up, sl_up, det_up = detect_synthetic_or_single_sweep(m1, box_l, box_h, "BUY_PE", pivot=box_h)
-    if swept_up and trend_15m != "UPTREND":
-        opt_check = analyze_option_chart_confirmation(state, ltp, "BUY_PE")
-        if opt_check.get("confirmed"):
-            return {
-                "status": "TRIGGERED",
-                "setup_code": "S3_1M",
-                "setup_name": "S3 (1M Experimental Fake Breakout Hunt → Opposite Side Downside)",
-                "action": "BUY_PE",
-                "hunt_side": is_setup_trend_side("BUY_PE", trend_15m),
-                "trigger_tf": "1M",
-                "pattern": "S3_1M_FAKEOUT_REJECT",
-                "sweep_extreme": sl_up,
-                "chase_distance_pts": round(abs(ltp - sl_up), 1),
-                "index_sl": sl_up + REF_SL_BUFFER,
-                "sweep_detail": f"[EXPERIMENTAL] 1M Sideways Box ({box_l}-{box_h}) upside liquidity hunted & rejected: {det_up}",
-                "option_info": opt_check,
-                "zone_obj": {"id": "S3_1M_BOX", "type": "SIDEWAYS_BOX", "low": box_l, "high": box_h, "pivot": box_h, "strength": "STRONG"},
-            }
-
-    c1, c2, c3 = m1.iloc[-1], m1.iloc[-2], m1.iloc[-3]
-    b2 = abs(int(c2["c"]) - int(c2["o"]))
-    b3 = abs(int(c3["c"]) - int(c3["o"]))
-    c1_body = int(c1["c"]) - int(c1["o"])
-
-    if (b2 <= S3_1M_MICRO_BODY_MAX_PTS and b3 <= S3_1M_MICRO_BODY_MAX_PTS
-            and int(c2["l"]) <= box_l + S3_1M_MICRO_BOUNDARY_BUF_PTS
-            and c1_body >= S3_1M_MICRO_EXPANSION_MIN_PTS and int(c1["c"]) > int(c2["h"])):
-        opt_check = analyze_option_chart_confirmation(state, ltp, "BUY_CE")
-        if opt_check.get("confirmed"):
-            low_sl = min(int(c1["l"]), int(c2["l"]), int(c3["l"]))
-            return {
-                "status": "TRIGGERED",
-                "setup_code": "S3_1M",
-                "setup_name": "S3 (1M Experimental Micro-Candle Seller Exhaustion → Blast)",
-                "action": "BUY_CE",
-                "hunt_side": is_setup_trend_side("BUY_CE", trend_15m),
-                "trigger_tf": "1M",
-                "pattern": "S3_1M_MICRO_ABSORPTION",
-                "sweep_extreme": low_sl,
-                "chase_distance_pts": round(abs(ltp - low_sl), 1),
-                "index_sl": low_sl - REF_SL_BUFFER,
-                "sweep_detail": f"[EXPERIMENTAL] 1M tiny absorption candles ({b3}pt, {b2}pt) held at box bottom {box_l} + +{c1_body}pt Green expansion",
-                "option_info": opt_check,
-                "zone_obj": {"id": "S3_1M_BOX", "type": "SIDEWAYS_BOX", "low": box_l, "high": box_h, "pivot": box_l, "strength": "STRONG"},
             }
 
     return None
@@ -1782,12 +1620,9 @@ YELLOW FLASH RULEBOOK v6 CHECKLIST YOU MUST VERIFY FROM THE RAW CANDLES:
    - S1 Trend-Side (aligned with 15M trend): 1st clean hunt + confirmation candle is valid.
    - S1 Counter-Trend (against 15M trend): Must be at a major zone AND have either a 2nd hunt (or Option decay low sweep) or a pre-hunt sideways pause.
    - S2 (Prev-Day High/Low or Clean Origin): Must show decisive rejection wick or 2-candle synthetic reclaim.
-   - S3 (Sideways Box, 5M production): Fakeout outside box reclaimed back inside, or micro-candle exhaustion at boundary.
-   - S3_1M (EXPERIMENTAL, same mechanic as S3 but on 1M candles — only appears if explicitly enabled): same checks as S3 above.
+   - S3 (Sideways Box): Fakeout outside box reclaimed back inside, or micro-candle exhaustion at boundary.
    - TREND_PULLBACK: Pullback swept previous 5M candle high/low and closed back in 15M trend direction.
-4. No Chasing ('Unch bhavala entry nahi') — SETUP-SPECIFIC, check `Setup Code` before applying:
-   - S1 or S2: if `Distance from Sweep Extreme` is >35 pts, output WAIT (chasing a runaway candle).
-   - S3, S3_1M, or TREND_PULLBACK: Python applies NO distance cap for these (the box width / pullback candle already bounds the entry) — do NOT reject on distance alone for these setup codes. Still output WAIT if price has run into an opposing obstacle/zone regardless of setup.
+4. No Chasing ('Unch bhavala entry nahi'): Check `Distance from Sweep Extreme`. If price has already run >35 pts away from the sweep extreme or into an opposing obstacle, output WAIT.
 5. Confirmations: Provide 2 to 4 concrete observations citing exact REAL index/option prices (delta + BASE). Generic phrases without numbers are rejected.
 
 Respond ONLY with valid JSON."""
@@ -2493,10 +2328,6 @@ def run_nifty_1m_tick(shared_store):
         if is_5m_boundary:
             zones = update_live_intraday_zones(state, zones, tf_data, ltp)
 
-        # EXPERIMENTAL (v8.1, opt-in): refresh the 1M S3 box on EVERY eligible 1-min scan
-        # (not just 5-min boundaries) — see update_live_s3_1m_box() docstring for the bugfix note.
-        update_live_s3_1m_box(state, tf_data)
-
         opening_session = (now.hour == 9 and now.minute < 45)
 
         # 1. Evaluate S1 & S2 Setups at Touched Zone
@@ -2526,16 +2357,6 @@ def run_nifty_1m_tick(shared_store):
                 process_triggered_setup(state, tf_data, ltp, pb_res["zone_obj"], zones, trend_info, pb_res)
                 return
 
-        # 4. EXPERIMENTAL (v8, opt-in via NIFTY_ENABLE_S3_1M_EXPERIMENTAL — OFF by default):
-        #    S3 1-Minute variant, evaluated LAST so production setups (1-3 above) always get
-        #    first right-of-way even when this is enabled. Fully separate signal (setup_code
-        #    "S3_1M"), does not replace or alter the production S3 setup evaluated in step 2.
-        if ENABLE_S3_1M_EXPERIMENTAL and not opening_session:
-            s3_1m_res = evaluate_s3_1m_sideways_setup(state, tf_data, ltp, trend_info)
-            if s3_1m_res and s3_1m_res.get("status") == "TRIGGERED":
-                process_triggered_setup(state, tf_data, ltp, s3_1m_res["zone_obj"], zones, trend_info, s3_1m_res)
-                return
-
     except Exception:
         log.exception("[NIFTY] run_nifty_1m_tick error")
     finally:
@@ -2543,7 +2364,3 @@ def run_nifty_1m_tick(shared_store):
             _nifty_lock.release()
         except RuntimeError:
             pass
-
-
-# main.py V8.1 compatiblity sathi alias:
-run_1h_analysis = hourly_job
