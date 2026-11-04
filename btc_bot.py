@@ -1,22 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   BITCOIN (BTCUSD) INSTITUTIONAL TRADING ENGINE — V8.2 (PRODUCTION)      ║
-║   Namespace: BTC:*  |  Delta Exchange Public API (30M Closed Bar Engine) ║
+║   BITCOIN (BTCUSD) INSTITUTIONAL TRADING ENGINE — V8.3 (MULTI-TF)        ║
+║   Namespace: BTC:*  |  Delta Exchange Public API (5M Execution Engine)   ║
 ║                                                                          ║
-║   TOP 5 PROVEN SETUPS INTEGRATED:                                        ║
-║   1. S3_BREAKOUT_LIQUIDITY_HUNT (1:3 RR - Wyckoff Pre-Sweep Blast)       ║
-║   2. ASIAN_OPEN_SWEEP (1:2 RR - Morning 07:30 to 11:30 IST Judas Trap)   ║
-║   3. USER_3SWING_INDUCEMENT_TRAP (1:2 RR - SMC Inducement Sweep)         ║
-║   4. S3_BREAKOUT_OPT (1:3 RR - Trend Aligned Compression Breakout)       ║
-║   5. S2_PDH_PDL_SWEEP (1:2 RR - 0.7 ATR Buffer Daily Level Sweep)        ║
+║   TOP 6 PROVEN SETUPS INTEGRATED:                                        ║
+║   1. 5M_VOLUME_EXPANSION_BLAST (1:3 RR - Tight Range + Vol Anomaly)      ║
+║   2. S3_BREAKOUT_LIQUIDITY_HUNT (1:3 RR - Wyckoff Pre-Sweep Blast)       ║
+║   3. ASIAN_OPEN_SWEEP (1:2 RR - Morning 07:30 to 11:30 IST Judas Trap)   ║
+║   4. USER_3SWING_INDUCEMENT_TRAP (1:2 RR - SMC Inducement Sweep)         ║
+║   5. S3_BREAKOUT_OPT (1:3 RR - Trend Aligned Compression Breakout)       ║
+║   6. S2_PDH_PDL_SWEEP (1:2 RR - 0.7 ATR Buffer Daily Level Sweep)        ║
 ║                                                                          ║
 ║   CORE SECURITY & STABILITY ENHANCEMENTS:                                ║
-║   • Fail-Closed AI Guard: If AI fails or times out, trade is 100% BLOCKED║
-║   • Closed-Candle Guard: Ignores running candle (Zero Repainting/Flicker)║
-║   • Dynamic ATR Range: Replaces static $450 with 3.0x ATR search window  ║
-║   • 30M 50 EMA Slope & Structure: Prevents fighting macro momentum       ║
-║   • Delta API Key & Secret Header integration included                   ║
-║   • Gemini Free Tier Anti-Ban: 5.0s Delay (<= 12 RPM) + 429 Auto-Retry   ║
+║   • Multi-TF Sync: 15M Macro Structure + 5M Precision Execution          ║
+║   • 503 Retry Guard: 2.5s Sleep & Retry for Gemini Server Overload       ║
+║   • Fail-Closed AI Guard: If AI fails or times out, trade is BLOCKED     ║
 ║   • Built-in HTTP Health Server (Port 8080 / $PORT) for UptimeRobot      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
@@ -111,7 +109,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - BTC Institutional Liquidity Engine v8.2 Active\n")
+        self.wfile.write(b"OK - BTC Institutional Liquidity Engine v8.3 Active\n")
 
     def log_message(self, format, *args):
         return
@@ -127,7 +125,7 @@ def start_health_server():
 
 
 # ==============================================================================
-# DUAL AI SUPERVISOR (FAIL-CLOSED + 5.0S RATE-LIMIT SHIELD + 429 AUTO-RETRY)
+# DUAL AI SUPERVISOR (FAIL-CLOSED + 503 RETRY GUARD)
 # ==============================================================================
 def call_ai_json(system_prompt, user_prompt, max_tokens=700):
     global _gemini_idx, _last_gemini_call, _daily_ai_call_count
@@ -152,9 +150,17 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
             try:
                 _daily_ai_call_count += 1
                 r = requests.post(url, json=payload, timeout=20)
+                
+                # 429 Rate Limit Retry
                 if r.status_code == 429:
                     log.warning("[BTC] Gemini 429 rate limit hit. Pausing 8s before retry...")
                     time.sleep(8.0)
+                    _last_gemini_call = time.time()
+                    r = requests.post(url, json=payload, timeout=20)
+                # 500/503 Server Overload Retry (NEW)
+                elif r.status_code in (500, 503):
+                    log.warning(f"[BTC] Gemini HTTP {r.status_code} on key #{_gemini_idx}. Pausing 2.5s and retrying...")
+                    time.sleep(2.5)
                     _last_gemini_call = time.time()
                     r = requests.post(url, json=payload, timeout=20)
 
@@ -244,27 +250,27 @@ def tg_send(text):
 # ==============================================================================
 # TECHNICAL INDICATORS, ZONES & FRACTAL SWINGS
 # ==============================================================================
-def compute_indicators(df_30m: pd.DataFrame):
-    df = df_30m.copy()
-    high, low, close = df["h"], df["l"], df["c"]
+def compute_indicators(df: pd.DataFrame):
+    df_new = df.copy()
+    high, low, close = df_new["h"], df_new["l"], df_new["c"]
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    df["atr14"] = tr.rolling(14).mean().bfill()
-    df["ema50"] = close.ewm(span=50, adjust=False).mean()
-    df["ema50_slope"] = df["ema50"] - df["ema50"].shift(12)  # 6-Hour slope
+    df_new["atr14"] = tr.rolling(14).mean().bfill()
+    df_new["ema50"] = close.ewm(span=50, adjust=False).mean()
+    df_new["ema50_slope"] = df_new["ema50"] - df_new["ema50"].shift(12)
 
-    # 48-Hour (96 bars) rolling range
-    df["roll_h96"] = high.rolling(96).max()
-    df["roll_l96"] = low.rolling(96).min()
-    df["range_pct"] = (close - df["roll_l96"]) / (df["roll_h96"] - df["roll_l96"] + 1e-6) * 100
+    # 96 bars rolling range
+    df_new["roll_h96"] = high.rolling(96).max()
+    df_new["roll_l96"] = low.rolling(96).min()
+    df_new["range_pct"] = (close - df_new["roll_l96"]) / (df_new["roll_h96"] - df_new["roll_l96"] + 1e-6) * 100
 
-    # Daily PDH / PDL (By UTC Date, matching HTML Tester v1.5)
-    df["utc_date"] = df["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
-    daily = df.groupby("utc_date").agg({"h": "max", "l": "min"}).shift(1)
+    # Daily PDH / PDL (By UTC Date)
+    df_new["utc_date"] = df_new["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
+    daily = df_new.groupby("utc_date").agg({"h": "max", "l": "min"}).shift(1)
     daily.columns = ["pdh", "pdl"]
     daily = daily.reset_index()
-    df = df.merge(daily, on="utc_date", how="left")
-    return df
+    df_new = df_new.merge(daily, on="utc_date", how="left")
+    return df_new
 
 
 def find_swings(df: pd.DataFrame, w=3):
@@ -278,28 +284,28 @@ def find_swings(df: pd.DataFrame, w=3):
     return sh, sl
 
 
-def build_btc_zones(state: BtcState, df_30m: pd.DataFrame, ltp: float):
-    """Maintains active_zones in BtcState with dynamic ATR window (replaces static $450)."""
+def build_btc_zones(state: BtcState, df_macro: pd.DataFrame, ltp: float):
+    """Maintains active_zones in BtcState using 15M Macro data."""
     zones = []
-    if df_30m.empty or len(df_30m) < 20:
+    if df_macro.empty or len(df_macro) < 20:
         return zones
 
-    atr = float(df_30m["atr14"].iloc[-1]) if "atr14" in df_30m.columns else 350.0
+    atr = float(df_macro["atr14"].iloc[-1]) if "atr14" in df_macro.columns else 350.0
     dynamic_window = max(600.0, 3.0 * atr)
 
-    pdh = df_30m["pdh"].iloc[-1] if "pdh" in df_30m.columns else None
-    pdl = df_30m["pdl"].iloc[-1] if "pdl" in df_30m.columns else None
+    pdh = df_macro["pdh"].iloc[-1] if "pdh" in df_macro.columns else None
+    pdl = df_macro["pdl"].iloc[-1] if "pdl" in df_macro.columns else None
     if pd.notna(pdh) and pd.notna(pdl):
         pdh, pdl = float(pdh), float(pdl)
         zones.append({"id": "BTC_PDH", "type": "RESISTANCE", "pivot": pdh, "low": pdh - 60, "high": pdh + 60, "why": f"Previous Day High (${pdh})"})
         zones.append({"id": "BTC_PDL", "type": "SUPPORT", "pivot": pdl, "low": pdl - 60, "high": pdl + 60, "why": f"Previous Day Low (${pdl})"})
 
-    for i in range(3, len(df_30m) - 3):
-        h_v, l_v = float(df_30m.loc[i, "h"]), float(df_30m.loc[i, "l"])
-        if abs(h_v - ltp) <= dynamic_window and h_v >= df_30m.loc[i - 3:i + 3, "h"].max():
-            zones.append({"id": f"BTC_SWH_{int(h_v)}", "type": "RESISTANCE", "pivot": h_v, "low": h_v - 50, "high": h_v + 50, "why": f"30M Swing High Liquidity (${h_v})"})
-        if abs(l_v - ltp) <= dynamic_window and l_v <= df_30m.loc[i - 3:i + 3, "l"].min():
-            zones.append({"id": f"BTC_SWL_{int(l_v)}", "type": "SUPPORT", "pivot": l_v, "low": l_v - 50, "high": l_v + 50, "why": f"30M Swing Low Liquidity (${l_v})"})
+    for i in range(3, len(df_macro) - 3):
+        h_v, l_v = float(df_macro.loc[i, "h"]), float(df_macro.loc[i, "l"])
+        if abs(h_v - ltp) <= dynamic_window and h_v >= df_macro.loc[i - 3:i + 3, "h"].max():
+            zones.append({"id": f"BTC_SWH_{int(h_v)}", "type": "RESISTANCE", "pivot": h_v, "low": h_v - 50, "high": h_v + 50, "why": f"15M Swing High Liquidity (${h_v})"})
+        if abs(l_v - ltp) <= dynamic_window and l_v <= df_macro.loc[i - 3:i + 3, "l"].min():
+            zones.append({"id": f"BTC_SWL_{int(l_v)}", "type": "SUPPORT", "pivot": l_v, "low": l_v - 50, "high": l_v + 50, "why": f"15M Swing Low Liquidity (${l_v})"})
 
     zones.sort(key=lambda z: abs(z["pivot"] - ltp))
     dedup = []
@@ -311,10 +317,63 @@ def build_btc_zones(state: BtcState, df_30m: pd.DataFrame, ltp: float):
 
 
 # ==============================================================================
-# TOP 5 INSTITUTIONAL PATTERN DETECTORS (ON CLOSED 30M BAR)
+# TOP 6 INSTITUTIONAL PATTERN DETECTORS (ON CLOSED 5M EXECUTION BAR)
 # ==============================================================================
 
-# SETUP 1: S3 Breakout + Pre-Breakout Liquidity Hunt (1:3 RR)
+# SETUP 1: 5M Volume Expansion Blast (Trend Aligned Breakout)
+def check_5m_volume_expansion(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
+    if len(df_5m) < 20 or len(df_15m) < 10:
+        return None
+        
+    i = len(df_5m) - 1
+    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
+    v_curr = float(df_5m["v"].iloc[i])
+    
+    v_avg = df_5m["v"].iloc[i-14:i].mean()
+    atr_5m = float(df_5m["atr14"].iloc[i])
+    ema50_15m = float(df_15m["ema50"].iloc[-1])
+    
+    # 5M Compression Box
+    box = df_5m.iloc[i - 6:i]
+    box_h, box_l = float(box["h"].max()), float(box["l"].min())
+    box_range = box_h - box_l
+    
+    if box_range <= 1.5 * atr_5m and v_curr > 3.5 * v_avg:
+        if c > box_h and c > ema50_15m and (c - o) > 0.8 * atr_5m:
+            sl = round(box_l, 1)
+            risk = max(60.0, round(c - sl, 1))
+            return {
+                "name": "5M_VOLUME_EXPANSION_BLAST",
+                "action": "BUY_LONG",
+                "tier": "A++ Institutional Breakout (+Volume Anomaly)",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c + 3.0 * risk, 1),
+                "be": round(c + 1.0 * risk, 1),
+                "rr": "1:3.0",
+                "why": f"Tight box (${box_l}-${box_h}) exploded UP with 3.5x Volume Anomaly ({int(v_curr)} vol) aligned with 15M Trend."
+            }
+            
+        if c < box_l and c < ema50_15m and (o - c) > 0.8 * atr_5m:
+            sl = round(box_h, 1)
+            risk = max(60.0, round(sl - c, 1))
+            return {
+                "name": "5M_VOLUME_EXPANSION_BLAST",
+                "action": "SELL_SHORT",
+                "tier": "A++ Institutional Breakout (+Volume Anomaly)",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c - 3.0 * risk, 1),
+                "be": round(c - 1.0 * risk, 1),
+                "rr": "1:3.0",
+                "why": f"Tight box (${box_l}-${box_h}) exploded DOWN with 3.5x Volume Anomaly ({int(v_curr)} vol) aligned with 15M Trend."
+            }
+            
+    return None
+
+# SETUP 2: S3 Breakout + Pre-Breakout Liquidity Hunt (1:3 RR)
 def check_s3_breakout_liq_hunt(df: pd.DataFrame):
     if len(df) < 15:
         return None
@@ -370,8 +429,7 @@ def check_s3_breakout_liq_hunt(df: pd.DataFrame):
 
     return None
 
-
-# SETUP 2: Asian Open Range (AOR) Sweep / Judas Swing (07:30 to 11:30 IST) (1:2 RR)
+# SETUP 3: Asian Open Range (AOR) Sweep / Judas Swing (07:30 to 11:30 IST) (1:2 RR)
 def check_asian_open_sweep(df: pd.DataFrame):
     if len(df) < 15:
         return None
@@ -435,8 +493,7 @@ def check_asian_open_sweep(df: pd.DataFrame):
 
     return None
 
-
-# SETUP 3: User 3-Swing Inducement Trap (1:2 RR)
+# SETUP 4: User 3-Swing Inducement Trap (1:2 RR)
 def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
     if len(df) < 30:
         return None
@@ -449,7 +506,6 @@ def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
     range_pct = float(df["range_pct"].iloc[i])
     slope = float(df["ema50_slope"].iloc[i])
 
-    # Bearish Inducement Trap: Swing 1 High -> Swing 2 Lower High -> Candle i Sweeps Swing 2
     if upper_wick >= 0.38 and c <= o and range_pct >= 65.0 and slope <= 0.25 * atr:
         recent_sh = [s for s in sw_h if s["idx"] <= i - 3]
         if len(recent_sh) >= 2:
@@ -479,7 +535,6 @@ def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
                             "why": f"Swept Inducement High (${s2['price']}) below Major High (${s1['price']}) with {int(upper_wick*100)}% Red wick"
                         }
 
-    # Bullish Inducement Trap: Swing 1 Low -> Swing 2 Higher Low -> Candle i Sweeps Swing 2
     if lower_wick >= 0.38 and c >= o and range_pct <= 35.0 and slope >= -0.25 * atr:
         recent_sl = [s for s in sw_l if s["idx"] <= i - 3]
         if len(recent_sl) >= 2:
@@ -511,8 +566,7 @@ def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
 
     return None
 
-
-# SETUP 4: S3 Breakout Trend Aligned (Clean Momentum) (1:3 RR)
+# SETUP 5: S3 Breakout Trend Aligned (Clean Momentum) (1:3 RR)
 def check_s3_breakout_opt(df: pd.DataFrame):
     if len(df) < 15:
         return None
@@ -564,8 +618,7 @@ def check_s3_breakout_opt(df: pd.DataFrame):
 
     return None
 
-
-# SETUP 5: S2 PDH / PDL Sweep (With 0.7 ATR Buffer & 1-Per-Day Limit) (1:2 RR)
+# SETUP 6: S2 PDH / PDL Sweep (With 0.7 ATR Buffer) (1:2 RR)
 def check_s2_pdh_pdl_sweep(df: pd.DataFrame, state: BtcState):
     if len(df) < 15:
         return None
@@ -584,7 +637,6 @@ def check_s2_pdh_pdl_sweep(df: pd.DataFrame, state: BtcState):
     upper_wick = (h - max(o, c)) / c_range
     lower_wick = (min(o, c) - l) / c_range
 
-    # PDH Sweep & Reject (Max 1 per UTC day)
     if not state.get(f"s2_taken_{d_key}_PDH"):
         if h > pdh and c < pdh and upper_wick >= 0.35 and c <= o and slope <= 0.25 * atr:
             sl = round(h + 0.7 * atr, 1)
@@ -603,7 +655,6 @@ def check_s2_pdh_pdl_sweep(df: pd.DataFrame, state: BtcState):
                 "why": f"Swept Previous Day High (${pdh}) with {int(upper_wick*100)}% rejection wick and closed RED"
             }
 
-    # PDL Sweep & Reclaim (Max 1 per UTC day)
     if not state.get(f"s2_taken_{d_key}_PDL"):
         if l < pdl and c > pdl and lower_wick >= 0.35 and c >= o and slope >= -0.25 * atr:
             sl = round(l - 0.7 * atr, 1)
@@ -635,20 +686,17 @@ def run_deterministic_filters(df: pd.DataFrame, setup: dict):
     ema50 = float(df["ema50"].iloc[i])
     risk = float(setup["risk"])
 
-    # 1. Bloated Risk Check (> 2.5x ATR auto-reject)
-    if risk > 2.5 * atr:
-        log.info(f"[BTC] Blocked {setup['name']}: Bloated Risk (${risk} > 2.5x ATR ${2.5*atr:.1f})")
+    if risk > 3.0 * atr:
+        log.info(f"[BTC] Blocked {setup['name']}: Bloated Risk (${risk} > 3.0x ATR ${3.0*atr:.1f})")
         return False, "Bloated Risk"
 
-    # 2. 3-Bar FOMO Vertical Run-Up Check (> 3.0x ATR)
     if i >= 3:
         open_3 = float(df["o"].iloc[i - 3])
         run_up = (c - open_3) if setup["action"] == "BUY_LONG" else (open_3 - c)
-        if run_up > 3.0 * atr:
-            log.info(f"[BTC] Blocked {setup['name']}: 3-Bar FOMO Chase (${run_up:.1f} > 3.0x ATR)")
+        if run_up > 3.5 * atr:
+            log.info(f"[BTC] Blocked {setup['name']}: 3-Bar FOMO Chase (${run_up:.1f} > 3.5x ATR)")
             return False, "FOMO Chase"
 
-    # 3. 50 EMA Headroom Wall Check
     ema_note = f"Clear (50 EMA at ${ema50:.1f})"
     if setup["action"] == "BUY_LONG" and c < ema50 and (ema50 - c) < risk:
         ema_note = f"⚠️ WALL AHEAD: 50 EMA at ${ema50:.1f} (${ema50 - c:.0f} headroom < ${risk:.0f} risk)"
@@ -663,27 +711,20 @@ def run_deterministic_filters(df: pd.DataFrame, setup: dict):
 # DIAGNOSTIC STARTUP CHECK & ROUTINE HEALTH AUDITS
 # ==============================================================================
 def run_startup_diagnostics(state: BtcState):
-    """Pings all APIs and sends an initialization diagnostic card to Telegram."""
     log.info("[BTC] 🔍 Running Startup Diagnostic Suite...")
     now = datetime.now(IST)
 
-    # 1. Delta Exchange API Ping
     t0 = time.time()
-    df_test = fetch_delta_candles(BTC_SYMBOL, "30m", hours_back=3, closed_only=False)
+    df_test = fetch_delta_candles(BTC_SYMBOL, "5m", hours_back=3, closed_only=False)
     delta_lat = int((time.time() - t0) * 1000)
     delta_status = "ONLINE" if not df_test.empty else "OFFLINE"
     ltp_test = float(df_test.iloc[-1]["c"]) if not df_test.empty else 0.0
 
-    # 2. AI Supervisor Ping
     t0 = time.time()
-    ai_test_res, ai_provider = call_ai_json(
-        'Respond strictly in JSON: {"status":"ok"}',
-        "Diagnostic ping. Return status ok."
-    )
+    ai_test_res, ai_provider = call_ai_json('Respond strictly in JSON: {"status":"ok"}', "Diagnostic ping. Return status ok.")
     ai_lat = int((time.time() - t0) * 1000)
     ai_status = f"ONLINE ({ai_lat}ms)" if ai_test_res else "OFFLINE / UNREACHABLE"
 
-    # 3. State & Health Port
     state.set("diag_test", True, ttl=60)
     state_status = "OK" if state.get("diag_test") else "ERROR"
 
@@ -695,21 +736,21 @@ def run_startup_diagnostics(state: BtcState):
 🟢 <b>State Cache     :</b> <code>{state_status}</code>
 🟢 <b>HTTP Health Check:</b> <code>RUNNING (Port {PORT} - UptimeRobot Ready)</code>
 
-🎯 <b>Active Core Setups (Top 5):</b>
-• <code>S3_BREAKOUT_LIQUIDITY_HUNT</code> (1:3 RR)
-• <code>ASIAN_OPEN_SWEEP</code> (07:30 - 11:30 IST, 1:2 RR)
-• <code>USER_3SWING_INDUCEMENT_TRAP</code> (1:2 RR)
-• <code>S3_BREAKOUT_OPT</code> (1:3 RR)
-• <code>S2_PDH_PDL_SWEEP</code> (1:2 RR)
+🎯 <b>Active Core Setups (Top 6 Multi-TF):</b>
+- <code>5M_VOLUME_EXPANSION_BLAST</code> (Tight Range + Vol Spike)
+- <code>S3_BREAKOUT_LIQUIDITY_HUNT</code> (1:3 RR)
+- <code>ASIAN_OPEN_SWEEP</code> (07:30 - 11:30 IST)
+- <code>USER_3SWING_INDUCEMENT_TRAP</code> (1:2 RR)
+- <code>S3_BREAKOUT_OPT</code> (1:3 RR)
+- <code>S2_PDH_PDL_SWEEP</code> (1:2 RR)
 
-🛡️ <i>Fail-Closed AI Guard active. Surveillance loop initialized.</i>"""
+🛡️ <i>Fail-Closed AI Guard & 503 Retry active.</i>"""
 
     tg_send(startup_msg)
     log.info("[BTC] ✅ Startup diagnostics complete and report pushed to Telegram.")
 
 
-def check_daily_0915_health_report(state: BtcState, df_30m: pd.DataFrame):
-    """Sends Daily System Health Report at 09:15 AM IST (Indian Market Open)."""
+def check_daily_0915_health_report(state: BtcState, df_15m: pd.DataFrame):
     global _last_daily_report_date
     now = datetime.now(IST)
     today_str = now.strftime("%Y-%m-%d")
@@ -717,32 +758,29 @@ def check_daily_0915_health_report(state: BtcState, df_30m: pd.DataFrame):
     if now.hour == 9 and now.minute >= 15 and _last_daily_report_date != today_str:
         _last_daily_report_date = today_str
 
-        ltp = float(df_30m.iloc[-1]["c"]) if not df_30m.empty else 0.0
-        ema50 = float(df_30m["ema50"].iloc[-1]) if "ema50" in df_30m.columns else 0.0
-        pdh = float(df_30m["pdh"].iloc[-1]) if "pdh" in df_30m.columns and pd.notna(df_30m["pdh"].iloc[-1]) else 0.0
-        pdl = float(df_30m["pdl"].iloc[-1]) if "pdl" in df_30m.columns and pd.notna(df_30m["pdl"].iloc[-1]) else 0.0
+        ltp = float(df_15m.iloc[-1]["c"]) if not df_15m.empty else 0.0
+        ema50 = float(df_15m["ema50"].iloc[-1]) if "ema50" in df_15m.columns else 0.0
+        pdh = float(df_15m["pdh"].iloc[-1]) if "pdh" in df_15m.columns and pd.notna(df_15m["pdh"].iloc[-1]) else 0.0
+        pdl = float(df_15m["pdl"].iloc[-1]) if "pdl" in df_15m.columns and pd.notna(df_15m["pdl"].iloc[-1]) else 0.0
 
         daily_msg = f"""☀️ <b>[DAILY 09:15 AM SYSTEM HEALTH AUDIT]</b>
 📅 <code>{now.strftime('%d %b %Y | %H:%M IST')}</code>
 
 📊 <b>Engine Status:</b>
-• AI Calls Today   : <code>{_daily_ai_call_count} / 500 Calls</code>
-• 30M Surveillance : <code>ACTIVE (Closed-bar only)</code>
-• Uptime Server    : <code>Port {PORT} (200 OK)</code>
+- AI Calls Today   : <code>{_daily_ai_call_count} / 500 Calls</code>
+- 5M Surveillance  : <code>ACTIVE (Closed-bar execution)</code>
+- Uptime Server    : <code>Port {PORT} (200 OK)</code>
 
-🗺️ <b>Macro Context:</b>
-• BTC LTP : <b>${ltp:,.1f}</b>
-• 50 EMA  : <b>${ema50:,.1f}</b> ({'Bullish' if ltp > ema50 else 'Bearish'})
-• PDH / PDL: <b>${pdh:,.1f} / ${pdl:,.1f}</b>
+🗺️ <b>Macro Context (15M):</b>
+- BTC LTP : <b>${ltp:,.1f}</b>
+- 50 EMA  : <b>${ema50:,.1f}</b> ({'Bullish' if ltp > ema50 else 'Bearish'})
+- PDH / PDL: <b>${pdh:,.1f} / ${pdl:,.1f}</b>
 
-✅ <i>All 5 setups active. Fail-Closed Guard verified.</i>"""
-
+✅ <i>All 6 Multi-TF setups active.</i>"""
         tg_send(daily_msg)
-        log.info("[BTC] ☀️ Pushed Daily 09:15 AM System Health Audit to Telegram.")
 
 
-def check_6h_macro_reanalysis(state: BtcState, df_30m: pd.DataFrame):
-    """Executes 6-Hour Macro Re-analysis at 05:30, 11:30, 17:30, 23:30 IST."""
+def check_6h_macro_reanalysis(state: BtcState, df_15m: pd.DataFrame):
     global _last_macro_reanalysis_slot
     now = datetime.now(IST)
 
@@ -755,17 +793,53 @@ def check_6h_macro_reanalysis(state: BtcState, df_30m: pd.DataFrame):
 
     if cur_slot and cur_slot != _last_macro_reanalysis_slot:
         _last_macro_reanalysis_slot = cur_slot
-        ltp = float(df_30m.iloc[-1]["c"]) if not df_30m.empty else 0.0
-        ema50 = float(df_30m["ema50"].iloc[-1]) if "ema50" in df_30m.columns else 0.0
-        r_pct = float(df_30m["range_pct"].iloc[-1]) if "range_pct" in df_30m.columns else 50.0
+        ltp = float(df_15m.iloc[-1]["c"]) if not df_15m.empty else 0.0
+        ema50 = float(df_15m["ema50"].iloc[-1]) if "ema50" in df_15m.columns else 0.0
+        r_pct = float(df_15m["range_pct"].iloc[-1]) if "range_pct" in df_15m.columns else 50.0
 
         log.info(f"[BTC] ═════════ [6-HOUR MACRO RE-ANALYSIS: {now.strftime('%H:%M IST')}] ═════════")
         log.info(f"[BTC] LTP: ${ltp:,.1f} | 50 EMA: ${ema50:,.1f} | 48h Range Percentile: {r_pct:.1f}%")
         log.info("[BTC] Active Setups Refreshed. Next re-analysis in 6 Hours.")
 
+        # Re-map zones and save to shared state
+        zones = build_btc_zones(state, df_15m, ltp)
+        slope = float(df_15m["ema50_slope"].iloc[-1])
+        r_high = float(df_15m["roll_h96"].iloc[-1])
+        r_low = float(df_15m["roll_l96"].iloc[-1])
+        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
+
+        sys_p = (
+            "You are the Lead Institutional Crypto Trading Supervisor. "
+            "Provide a concise 1-2 sentence macro structure assessment for BTCUSD. "
+            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
+        )
+        usr_p = (
+            f"Asset: BTCUSD | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp}\n"
+            f"50 EMA: ${ema50:.1f} (Slope: {slope:+.1f}) | 48h Range: ${r_low:.0f} - ${r_high:.0f} (Pos: {r_pct:.1f}%)\n"
+            f"Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
+        )
+        ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
+        ai_text = (ai_res or {}).get("assessment", "Consolidation within macro range. Monitor S3 box breakout or PDH/PDL sweeps.")
+        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
+
+        z_lines = [f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.1f}</code> ({esc(z['why'])})" for z in zones[:3]]
+
+        msg = f"""🏛️ <b>[BITCOIN] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
+
+📊 <b>LTP     :</b> <b>${ltp:,.1f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
+📐 <b>50 EMA :</b> <code>${ema50:,.1f}</code> (Slope: <code>{slope:+.1f}</code>)
+📏 <b>48h Rng :</b> <code>${r_low:,.0f} — ${r_high:,.0f}</code> (Pos: <code>{r_pct:.1f}%</code>)
+
+🗺️ <b>Active 15M Macro Zones:</b>
+{chr(10).join(z_lines)}
+
+🧠 <b>AI Macro Audit ({esc(provider)}):</b> [{esc(ai_bias)}]
+<i>{esc(ai_text)}</i>"""
+        tg_send(msg)
+
 
 # ==============================================================================
-# MAIN CYCLE RUNNER (EVALUATES CLOSED 30M CANDLES WITH TRANSPARENT LOGS)
+# MAIN CYCLE RUNNER (EVALUATES CLOSED 5M CANDLES MULTI-TF)
 # ==============================================================================
 def run_btc_cycle(shared_store=None):
     if not _btc_lock.acquire(blocking=False):
@@ -773,64 +847,63 @@ def run_btc_cycle(shared_store=None):
 
     try:
         state = BtcState(shared_store)
-        now = datetime.now(IST)
 
-        # Fetch closed 30m candles (last 120 hours = 240 candles)
-        df_30m = fetch_delta_candles(BTC_SYMBOL, "30m", hours_back=120, closed_only=True)
-        if df_30m.empty or len(df_30m) < 35:
+        # Multi-TF Data Sync: 15M (Macro/Zones) + 5M (Execution)
+        df_15m = fetch_delta_candles(BTC_SYMBOL, "15m", hours_back=60, closed_only=True)
+        df_5m = fetch_delta_candles(BTC_SYMBOL, "5m", hours_back=24, closed_only=True)
+        
+        if df_5m.empty or len(df_5m) < 35 or df_15m.empty:
             return
 
-        df_30m = compute_indicators(df_30m)
-        ltp = float(df_30m["c"].iloc[-1])
-        last_bar_time = int(df_30m.iloc[-1]["time"])
+        df_15m = compute_indicators(df_15m)
+        df_5m = compute_indicators(df_5m)
+        
+        ltp = float(df_5m["c"].iloc[-1])
+        last_bar_time = int(df_5m.iloc[-1]["time"])
 
-        # Routine checks: 6H Macro and Daily 09:15
-        check_6h_macro_reanalysis(state, df_30m)
-        check_daily_0915_health_report(state, df_30m)
+        # Routine checks on 15M Macro context
+        check_6h_macro_reanalysis(state, df_15m)
+        check_daily_0915_health_report(state, df_15m)
 
-        # Refresh active zones in state
-        zones = build_btc_zones(state, df_30m, ltp)
+        # Refresh active zones in state based on 15M structure
+        zones = build_btc_zones(state, df_15m, ltp)
 
-        # Ensure we only evaluate each closed 30M candle once
-        if state.get("last_evaluated_30m_ts") == last_bar_time:
+        # Ensure we only evaluate each closed 5M candle once
+        if state.get("last_evaluated_5m_ts") == last_bar_time:
             return
+        state.set("last_evaluated_5m_ts", last_bar_time, ttl=300)
 
-        # Mark this 30M closed candle as evaluated
-        state.set("last_evaluated_30m_ts", last_bar_time, ttl=3600)
-
-        # Detailed step-by-step Koyeb log on candle close
-        closed_ts_str = df_30m["ts"].iloc[-1].strftime("%H:%M IST")
-        ema50 = float(df_30m["ema50"].iloc[-1])
-        slope = float(df_30m["ema50_slope"].iloc[-1])
+        closed_ts_str = df_5m["ts"].iloc[-1].strftime("%H:%M IST")
+        ema50 = float(df_15m["ema50"].iloc[-1])
+        slope = float(df_15m["ema50_slope"].iloc[-1])
         trend_label = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING/CHOP")
         nearest_str = f"{zones[0]['id']}: ${zones[0]['pivot']}" if zones else "None"
 
-        log.info(f"[BTC] ═════════ 30M CANDLE CLOSE AUDIT: {closed_ts_str} ═════════")
-        log.info(f"[BTC] Close: ${ltp:,.1f} | ATR14: ${df_30m['atr14'].iloc[-1]:.1f} | Trend: {trend_label} (50 EMA ${ema50:.1f}, Slope: {slope:+.1f})")
-        log.info(f"[BTC] Nearest Zone: {nearest_str} | AI Calls Today: {_daily_ai_call_count}/500")
+        log.info(f"[BTC] ═════════ 5M EXECUTION AUDIT: {closed_ts_str} ═════════")
+        log.info(f"[BTC] Close: ${ltp:,.1f} | 15M Trend: {trend_label} (50 EMA ${ema50:.1f})")
+        log.info(f"[BTC] Nearest 15M Zone: {nearest_str} | AI Calls Today: {_daily_ai_call_count}/500")
 
-        sw_h, sw_l = find_swings(df_30m, w=3)
+        sw_h, sw_l = find_swings(df_5m, w=3)
 
-        # Evaluate Top 5 Setups in strict priority order
+        # Evaluate Top 6 Setups on 5M Timeframe
         setup = (
-            check_s3_breakout_liq_hunt(df_30m)
-            or check_asian_open_sweep(df_30m)
-            or check_user_3swing_inducement(df_30m, sw_h, sw_l)
-            or check_s3_breakout_opt(df_30m)
-            or check_s2_pdh_pdl_sweep(df_30m, state)
+            check_5m_volume_expansion(df_5m, df_15m)
+            or check_s3_breakout_liq_hunt(df_5m)
+            or check_asian_open_sweep(df_5m)
+            or check_user_3swing_inducement(df_5m, sw_h, sw_l)
+            or check_s3_breakout_opt(df_5m)
+            or check_s2_pdh_pdl_sweep(df_5m, state)
         )
 
         if not setup:
-            log.info("[BTC] Setups Evaluated: S3_Liq=NO | Asian_Sweep=NO | 3Swing_Trap=NO | S3_Opt=NO | S2=NO -> WAITING")
+            log.info("[BTC] Setups Evaluated: Vol_Blast=NO | S3_Liq=NO | Asian_Sweep=NO | 3Swing_Trap=NO | S3_Opt=NO | S2=NO -> WAITING")
             return
 
-        # Run Deterministic Math Filters (Bloated Risk, FOMO Chase, EMA50 Wall)
-        passed, filter_msg = run_deterministic_filters(df_30m, setup)
+        passed, filter_msg = run_deterministic_filters(df_5m, setup)
         if not passed:
             log.warning(f"[BTC] Setup {setup['name']} rejected by deterministic check: {filter_msg}")
             return
 
-        # Check 4-Hour Cooldown per Setup + Direction
         cd_key = f"cd_{setup['name']}_{setup['action']}"
         cd_until = state.get(cd_key)
         if cd_until and time.time() < cd_until:
@@ -838,7 +911,6 @@ def run_btc_cycle(shared_store=None):
             log.info(f"[BTC] Cooldown active for {setup['name']} ({rem_m}m remaining). Skipped.")
             return
 
-        # DUAL AI SUPERVISOR AUDIT (FAIL-CLOSED POLICY)
         log.info(f"[BTC] 🧠 Calling AI Supervisor for {setup['name']} ({setup['action']})...")
         sys_p = (
             "You are the Lead Institutional Crypto Trading Supervisor. "
@@ -851,19 +923,17 @@ def run_btc_cycle(shared_store=None):
             f"Detected Setup: {setup['name']} ({setup['tier']})\n"
             f"Action: {setup['action']} | Entry: ${setup['entry']} | SL: ${setup['sl']} | TP: ${setup['tp']} ({setup['rr']} R:R)\n"
             f"Trigger Logic: {setup['why']}\n"
-            f"EMA50 Check: {setup['ema_note']} | ATR(14): ${df_30m['atr14'].iloc[-1]:.1f} | 48h Range Pos: {df_30m['range_pct'].iloc[-1]:.1f}%"
+            f"EMA50 Check: {setup['ema_note']} | ATR(14): ${df_5m['atr14'].iloc[-1]:.1f}"
         )
 
         ai_res, provider = call_ai_json(sys_p, usr_p)
 
-        # 🚨 FAIL-CLOSED GUARD: If AI is None or disapproved, trade is 100% blocked
         if not ai_res or not ai_res.get("approved", False):
-            reason = ai_res.get("view", "AI Disapproved") if ai_res else f"AI Offline ({provider})"
+            reason = ai_res.get("view", "AI Disapproved") if ai_res else f"AI Offline/503 Failed ({provider})"
             log.warning(f"[BTC] 🛑 Trade Blocked by Fail-Closed Safety Guard: {reason}")
             state.set(cd_key, time.time() + WAIT_COOLDOWN_MIN * 60, ttl=WAIT_COOLDOWN_MIN * 60)
             return
 
-        # Lock 4-Hour Cooldown & Daily S2 Key (if S2)
         state.set(cd_key, time.time() + (SIGNAL_COOLDOWN_MIN * 60), ttl=SIGNAL_COOLDOWN_MIN * 60)
         if "s2_daily_key" in setup:
             state.set(setup["s2_daily_key"], True, ttl=86400)
@@ -873,14 +943,14 @@ def run_btc_cycle(shared_store=None):
         ai_view = ai_res.get("view", "Institutional order flow alignment confirmed.")
         ai_conf = ai_res.get("confidence", "HIGH")
 
-        msg = f"""{em} <b>[BITCOIN - BTCUSD] {action_title} | {now.strftime('%H:%M IST')}</b>
+        msg = f"""{em} <b>[BITCOIN - BTCUSD] {action_title} | {datetime.now(IST).strftime('%H:%M IST')}</b>
 
 ⚡ <b>Setup    :</b> <code>{esc(setup['name'])}</code>
 🏆 <b>Tier     :</b> {esc(setup['tier'])}
 📊 <b>Risk:Rew :</b> <b>{setup['rr']} Target</b> (Risk: ${setup['risk']})
 
 🎯 <b>Entry    :</b> <b>${setup['entry']}</b>
-🛑 <b>StopLoss :</b> <b>${setup['sl']}</b> (Safe ATR Buffer)
+🛑 <b>StopLoss :</b> <b>${setup['sl']}</b>
 ✅ <b>1:1 BE   :</b> <b>${setup['be']}</b> (Move SL to Cost)
 🚀 <b>Target   :</b> <b>${setup['tp']}</b>
 
@@ -900,113 +970,17 @@ def run_btc_cycle(shared_store=None):
             pass
 
 
-def run_6h_analysis(shared_store=None):
-    """
-    6-Hour Macro Re-analysis for Bitcoin (BTCUSD).
-    Re-maps 48-hour range, 50 EMA slope, macro zones, and requests AI Macro Audit.
-    Pushes a clean Telegram Macro Card.
-    """
-    if not _btc_lock.acquire(blocking=False):
-        return
-
-    try:
-        state = BtcState(shared_store)
-        now = datetime.now(IST)
-
-        df_30m = fetch_delta_candles(BTC_SYMBOL, "30m", hours_back=120, closed_only=True)
-        if df_30m.empty or len(df_30m) < 35:
-            return
-
-        df_30m = compute_indicators(df_30m)
-        ltp = float(df_30m["c"].iloc[-1])
-        ema50 = float(df_30m["ema50"].iloc[-1])
-        slope = float(df_30m["ema50_slope"].iloc[-1])
-        r_pct = float(df_30m["range_pct"].iloc[-1])
-        r_high = float(df_30m["roll_h96"].iloc[-1])
-        r_low = float(df_30m["roll_l96"].iloc[-1])
-        atr = float(df_30m["atr14"].iloc[-1])
-        pdh = float(df_30m["pdh"].iloc[-1]) if pd.notna(df_30m["pdh"].iloc[-1]) else 0.0
-        pdl = float(df_30m["pdl"].iloc[-1]) if pd.notna(df_30m["pdl"].iloc[-1]) else 0.0
-
-        # Re-map zones and save to shared state
-        zones = build_btc_zones(state, df_30m, ltp)
-
-        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
-
-        log.info(f"[BTC] ═════════ 6-HOUR MACRO RE-ANALYSIS ({now.strftime('%H:%M IST')}) ═════════")
-        log.info(f"[BTC] LTP: ${ltp:,.1f} | 50 EMA: ${ema50:,.1f} (Slope: {slope:+.1f}) | Trend: {trend_bias}")
-        log.info(f"[BTC] 48h Range: ${r_low:,.1f} - ${r_high:,.1f} (Percentile: {r_pct:.1f}%) | ATR14: ${atr:.1f}")
-        log.info(f"[BTC] Active Zones ({len(zones)}): {', '.join([z['id'] for z in zones[:4]])}")
-        log.info(f"[BTC] ════════════════════════════════════════════════════════════")
-
-        # Ask AI Supervisor for a 1-sentence Macro Structure Assessment
-        sys_p = (
-            "You are the Lead Institutional Crypto Trading Supervisor. "
-            "Provide a concise 1-2 sentence macro structure assessment for BTCUSD. "
-            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
-        )
-        usr_p = (
-            f"Asset: BTCUSD | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp}\n"
-            f"50 EMA: ${ema50:.1f} (Slope: {slope:+.1f}) | 48h Range: ${r_low:.0f} - ${r_high:.0f} (Pos: {r_pct:.1f}%)\n"
-            f"PDH: ${pdh:.1f} | PDL: ${pdl:.1f} | Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
-        )
-
-        ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
-        ai_text = (ai_res or {}).get("assessment", "Consolidation within macro range. Monitor S3 box breakout or PDH/PDL sweeps.")
-        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
-
-        z_lines = []
-        if pdh > 0: z_lines.append(f"• <b>PDH Level:</b> <code>${pdh:,.1f}</code>")
-        if pdl > 0: z_lines.append(f"• <b>PDL Level:</b> <code>${pdl:,.1f}</code>")
-        for z in zones[:3]:
-            z_lines.append(f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.1f}</code> ({esc(z['why'])})")
-
-        msg = f"""🏛️ <b>[BITCOIN] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
-
-📊 <b>LTP     :</b> <b>${ltp:,.1f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
-📐 <b>50 EMA :</b> <code>${ema50:,.1f}</code> (Slope: <code>{slope:+.1f}</code>)
-📏 <b>48h Rng :</b> <code>${r_low:,.0f} — ${r_high:,.0f}</code> (Pos: <code>{r_pct:.1f}%</code>)
-
-🗺️ <b>Active Macro Zones:</b>
-{chr(10).join(z_lines)}
-
-🧠 <b>AI Macro Audit ({esc(provider)}):</b> [{esc(ai_bias)}]
-<i>{esc(ai_text)}</i>"""
-
-        tg_send(msg)
-        log.info(f"[BTC] 🏛️ 6-Hour Macro Re-analysis published to Telegram.")
-
-    except Exception:
-        log.exception("[BTC] Error in run_6h_analysis")
-    finally:
-        try:
-            _btc_lock.release()
-        except RuntimeError:
-            pass
-
-
-# Compatibility wrappers for main.py scheduler
 def run_btc_30m_tick(shared_store=None):
-    """Called every 30 minutes on closed candle by main.py."""
+    # Compatibility with main.py - we just call the cycle
     run_btc_cycle(shared_store)
-
 
 def run_btc_1m_tick(shared_store=None):
-    """Backward compatibility alias for 1m schedulers."""
     run_btc_cycle(shared_store)
 
-
-# ==============================================================================
-# STANDALONE ENTRY POINT (FOR KOYEB WORKER / WEB SERVICE)
-# ==============================================================================
 if __name__ == "__main__":
-    log.info("[BTC] Starting Bitcoin Institutional Engine v8.2 on Koyeb...")
-
-    # Start HTTP Health Check Server in background thread for UptimeRobot
+    log.info("[BTC] Starting Bitcoin Institutional Engine v8.3 on Koyeb...")
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
-
-    # Run Startup Diagnostic Suite
     state_init = BtcState()
     run_startup_diagnostics(state_init)
 
