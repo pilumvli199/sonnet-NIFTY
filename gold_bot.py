@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   GOLD (XAUTUSD) INSTITUTIONAL TRADING ENGINE — V8.3 (MULTI-TF)          ║
+║   GOLD (XAUTUSD) INSTITUTIONAL TRADING ENGINE — V8.5 (MULTI-TF)          ║
 ║   Namespace: GOLD:* | Logger: [GOLD] | Delta Exchange Public API         ║
 ║   Timeframe: 5M Execution Engine | Multi-Asset Isolation Enabled         ║
 ║                                                                          ║
@@ -112,7 +112,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Gold (XAUTUSD) Institutional Engine v8.3 Active\n")
+        self.wfile.write(b"OK - Gold (XAUTUSD) Institutional Engine v8.5 Active\n")
 
     def log_message(self, format, *args):
         return
@@ -280,7 +280,6 @@ def find_swings(df: pd.DataFrame, w=3):
 
 
 def build_gold_zones(state: GoldState, df_macro: pd.DataFrame, ltp: float):
-    """Maintains active_zones in GoldState using 15M Macro data."""
     zones = []
     if df_macro.empty or len(df_macro) < 20:
         return zones
@@ -328,7 +327,6 @@ def check_5m_volume_expansion(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     atr_5m = float(df_5m["atr14"].iloc[i])
     ema50_15m = float(df_15m["ema50"].iloc[-1])
     
-    # 5M Compression Box
     box = df_5m.iloc[i - 6:i]
     box_h, box_l = float(box["h"].max()), float(box["l"].min())
     box_range = box_h - box_l
@@ -432,7 +430,6 @@ def check_london_asian_sweep(df: pd.DataFrame):
     bar_ts = df["ts"].iloc[i]
     t_min = bar_ts.hour * 60 + bar_ts.minute
 
-    # Active Window: 12:30 to 16:30 IST (London Open Session for Gold)
     if not (750 <= t_min <= 990):
         return None
 
@@ -775,9 +772,6 @@ def check_daily_0915_health_report(state: GoldState, df_15m: pd.DataFrame):
         tg_send(daily_msg)
 
 
-# ==============================================================================
-# 6-HOUR MACRO RE-ANALYSIS FOR GOLD (CALLED AT 00, 06, 12, 18)
-# ==============================================================================
 def check_6h_macro_reanalysis(state: GoldState, df_15m: pd.DataFrame):
     global _last_macro_reanalysis_slot
     now = datetime.now(IST)
@@ -808,13 +802,11 @@ def check_6h_macro_reanalysis(state: GoldState, df_15m: pd.DataFrame):
         sys_p = (
             "You are the Lead Institutional Gold (XAUUSD) Trading Supervisor. "
             "Provide a concise 1-2 sentence macro structure assessment for Gold. "
-            "Respond strictly in JSON: {"macro_bias": "BULLISH/BEARISH/NEUTRAL", "assessment": "1-2 sentences"}"
+            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
         )
         usr_p = (
-            f"Asset: GOLD (XAUTUSD) | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp:.2f}
-"
-            f"50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | 48h Range: ${r_low:.2f} - ${r_high:.2f} (Pos: {r_pct:.1f}%)
-"
+            f"Asset: GOLD (XAUTUSD) | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp:.2f}\n"
+            f"50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | 48h Range: ${r_low:.2f} - ${r_high:.2f} (Pos: {r_pct:.1f}%)\n"
             f"Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
         )
         ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
@@ -846,6 +838,7 @@ def run_gold_cycle(shared_store=None):
 
     try:
         state = GoldState(shared_store)
+        state.set("last_tick", time.time(), ttl=86400)
 
         # Multi-TF Data Sync: 15M (Macro/Zones) + 5M (Execution)
         df_15m = fetch_delta_candles(GOLD_SYMBOL, "15m", hours_back=60, closed_only=True)
@@ -917,14 +910,10 @@ def run_gold_cycle(shared_store=None):
             '{"approved": true/false, "confidence": "HIGH/MEDIUM/LOW", "view": "1 concise sentence"}'
         )
         usr_p = (
-            f"Asset: GOLD (XAUTUSD) | Closed Bar Time: {closed_ts_str} | Close: ${ltp:.2f}
-"
-            f"Detected Setup: {setup['name']} ({setup['tier']})
-"
-            f"Action: {setup['action']} | Entry: ${setup['entry']:.2f} | SL: ${setup['sl']:.2f} | TP: ${setup['tp']:.2f} ({setup['rr']} R:R)
-"
-            f"Trigger Logic: {setup['why']}
-"
+            f"Asset: GOLD (XAUTUSD) | Closed Bar Time: {closed_ts_str} | Close: ${ltp:.2f}\n"
+            f"Detected Setup: {setup['name']} ({setup['tier']})\n"
+            f"Action: {setup['action']} | Entry: ${setup['entry']:.2f} | SL: ${setup['sl']:.2f} | TP: ${setup['tp']:.2f} ({setup['rr']} R:R)\n"
+            f"Trigger Logic: {setup['why']}\n"
             f"EMA50 Check: {setup['ema_note']} | ATR(14): ${df_5m['atr14'].iloc[-1]:.2f}"
         )
 
@@ -972,8 +961,82 @@ def run_gold_cycle(shared_store=None):
             pass
 
 
+def run_6h_analysis(shared_store=None):
+    """
+    6-Hour Macro Re-analysis for Gold (XAUTUSD).
+    Called by main.py at 05:32, 11:32, 17:32, 23:32 IST (UTC-aligned closes).
+    """
+    if not _gold_lock.acquire(blocking=False):
+        return
+
+    try:
+        state = GoldState(shared_store)
+        now = datetime.now(IST)
+
+        df_15m = fetch_delta_candles(GOLD_SYMBOL, "15m", hours_back=120, closed_only=True)
+        if df_15m.empty or len(df_15m) < 35:
+            return
+
+        df_15m = compute_indicators(df_15m)
+        ltp = float(df_15m["c"].iloc[-1])
+        ema50 = float(df_15m["ema50"].iloc[-1])
+        slope = float(df_15m["ema50_slope"].iloc[-1])
+        r_pct = float(df_15m["range_pct"].iloc[-1])
+        r_high = float(df_15m["roll_h96"].iloc[-1])
+        r_low = float(df_15m["roll_l96"].iloc[-1])
+        atr = float(df_15m["atr14"].iloc[-1])
+        pdh = float(df_15m["pdh"].iloc[-1]) if pd.notna(df_15m["pdh"].iloc[-1]) else 0.0
+        pdl = float(df_15m["pdl"].iloc[-1]) if pd.notna(df_15m["pdl"].iloc[-1]) else 0.0
+
+        zones = build_gold_zones(state, df_15m, ltp)
+        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
+
+        log.info(f"[GOLD] ═════════ 6-HOUR MACRO RE-ANALYSIS ({now.strftime('%H:%M IST')}) ═════════")
+        log.info(f"[GOLD] LTP: ${ltp:.2f} | 50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | Trend: {trend_bias}")
+        log.info(f"[GOLD] Active Zones ({len(zones)}): {', '.join([z['id'] for z in zones[:4]])}")
+
+        sys_p = (
+            "You are the Lead Institutional Gold (XAUUSD) Trading Supervisor. "
+            "Provide a concise 1-2 sentence macro structure assessment for Gold. "
+            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
+        )
+        usr_p = (
+            f"Asset: GOLD (XAUTUSD) | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp:.2f}\n"
+            f"50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | 48h Range: ${r_low:.2f} - ${r_high:.2f} (Pos: {r_pct:.1f}%)\n"
+            f"Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
+        )
+
+        ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
+        ai_text = (ai_res or {}).get("assessment", "Gold consolidating within key macro liquidity boundaries. Monitor London session sweeps.")
+        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
+
+        z_lines = [f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.2f}</code> ({esc(z['why'])})" for z in zones[:3]]
+
+        msg = f"""🏛️ <b>[GOLD] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
+
+📊 <b>LTP     :</b> <b>${ltp:,.2f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
+📐 <b>50 EMA :</b> <code>${ema50:,.2f}</code> (Slope: <code>{slope:+.2f}</code>)
+📏 <b>48h Rng :</b> <code>${r_low:,.1f} — ${r_high:,.1f}</code> (Pos: <code>{r_pct:.1f}%</code>)
+
+🗺️ <b>Active 15M Macro Zones:</b>
+{chr(10).join(z_lines)}
+
+🧠 <b>AI Macro Audit ({esc(provider)}):</b> [{esc(ai_bias)}]
+<i>{esc(ai_text)}</i>"""
+
+        tg_send(msg)
+        log.info(f"[GOLD] 🏛️ 6-Hour Macro Re-analysis published to Telegram.")
+
+    except Exception:
+        log.exception("[GOLD] Error in run_6h_analysis")
+    finally:
+        try:
+            _gold_lock.release()
+        except RuntimeError:
+            pass
+
+
 def run_gold_30m_tick(shared_store=None):
-    # Compatibility with main.py
     run_gold_cycle(shared_store)
 
 def run_gold_1m_tick(shared_store=None):
@@ -981,7 +1044,7 @@ def run_gold_1m_tick(shared_store=None):
 
 
 if __name__ == "__main__":
-    log.info("[GOLD] Starting Gold Institutional Engine v8.3 on Koyeb...")
+    log.info("[GOLD] Starting Gold Institutional Engine v8.5 on Koyeb...")
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     state_init = GoldState()
