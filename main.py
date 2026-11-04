@@ -356,7 +356,7 @@ def run_health_check():
             for m in dict.fromkeys(models_to_try):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={g_keys[0]}"
                 payload = {"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]}
-                r_gem = requests.post(url, json=payload, timeout=10)
+                r_gem = requests.post(url, json=payload, timeout=25)
                 if r_gem.status_code == 200:
                     res["Gemini"] = f"OK ({m})"
                     success = True
