@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   BITCOIN (BTCUSD) INSTITUTIONAL TRADING ENGINE — V8.3 (MULTI-TF)        ║
+║   BITCOIN (BTCUSD) INSTITUTIONAL TRADING ENGINE — V8.5 (MULTI-TF)        ║
 ║   Namespace: BTC:*  |  Delta Exchange Public API (5M Execution Engine)   ║
 ║                                                                          ║
 ║   TOP 6 PROVEN SETUPS INTEGRATED:                                        ║
@@ -109,7 +109,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - BTC Institutional Liquidity Engine v8.3 Active\n")
+        self.wfile.write(b"OK - BTC Institutional Liquidity Engine v8.5 Active\n")
 
     def log_message(self, format, *args):
         return
@@ -131,7 +131,6 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
     global _gemini_idx, _last_gemini_call, _daily_ai_call_count
 
     if GEMINI_API_KEYS:
-        # Rate-Limit Delayer: Minimum 5.0s between calls (Max 12 RPM < 15 RPM Free limit)
         now = time.time()
         elapsed = now - _last_gemini_call
         if elapsed < 5.0:
@@ -157,7 +156,7 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
                     time.sleep(8.0)
                     _last_gemini_call = time.time()
                     r = requests.post(url, json=payload, timeout=20)
-                # 500/503 Server Overload Retry (NEW)
+                # 500/503 Server Overload Retry
                 elif r.status_code in (500, 503):
                     log.warning(f"[BTC] Gemini HTTP {r.status_code} on key #{_gemini_idx}. Pausing 2.5s and retrying...")
                     time.sleep(2.5)
@@ -259,12 +258,10 @@ def compute_indicators(df: pd.DataFrame):
     df_new["ema50"] = close.ewm(span=50, adjust=False).mean()
     df_new["ema50_slope"] = df_new["ema50"] - df_new["ema50"].shift(12)
 
-    # 96 bars rolling range
     df_new["roll_h96"] = high.rolling(96).max()
     df_new["roll_l96"] = low.rolling(96).min()
     df_new["range_pct"] = (close - df_new["roll_l96"]) / (df_new["roll_h96"] - df_new["roll_l96"] + 1e-6) * 100
 
-    # Daily PDH / PDL (By UTC Date)
     df_new["utc_date"] = df_new["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
     daily = df_new.groupby("utc_date").agg({"h": "max", "l": "min"}).shift(1)
     daily.columns = ["pdh", "pdl"]
@@ -285,7 +282,6 @@ def find_swings(df: pd.DataFrame, w=3):
 
 
 def build_btc_zones(state: BtcState, df_macro: pd.DataFrame, ltp: float):
-    """Maintains active_zones in BtcState using 15M Macro data."""
     zones = []
     if df_macro.empty or len(df_macro) < 20:
         return zones
@@ -333,7 +329,6 @@ def check_5m_volume_expansion(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     atr_5m = float(df_5m["atr14"].iloc[i])
     ema50_15m = float(df_15m["ema50"].iloc[-1])
     
-    # 5M Compression Box
     box = df_5m.iloc[i - 6:i]
     box_h, box_l = float(box["h"].max()), float(box["l"].min())
     box_range = box_h - box_l
@@ -437,7 +432,6 @@ def check_asian_open_sweep(df: pd.DataFrame):
     bar_ts = df["ts"].iloc[i]
     t_min = bar_ts.hour * 60 + bar_ts.minute
 
-    # Active Window: 07:30 to 11:30 IST
     if not (450 <= t_min <= 690):
         return None
 
@@ -801,7 +795,6 @@ def check_6h_macro_reanalysis(state: BtcState, df_15m: pd.DataFrame):
         log.info(f"[BTC] LTP: ${ltp:,.1f} | 50 EMA: ${ema50:,.1f} | 48h Range Percentile: {r_pct:.1f}%")
         log.info("[BTC] Active Setups Refreshed. Next re-analysis in 6 Hours.")
 
-        # Re-map zones and save to shared state
         zones = build_btc_zones(state, df_15m, ltp)
         slope = float(df_15m["ema50_slope"].iloc[-1])
         r_high = float(df_15m["roll_h96"].iloc[-1])
@@ -847,6 +840,7 @@ def run_btc_cycle(shared_store=None):
 
     try:
         state = BtcState(shared_store)
+        state.set("last_tick", time.time(), ttl=86400)
 
         # Multi-TF Data Sync: 15M (Macro/Zones) + 5M (Execution)
         df_15m = fetch_delta_candles(BTC_SYMBOL, "15m", hours_back=60, closed_only=True)
@@ -970,15 +964,89 @@ def run_btc_cycle(shared_store=None):
             pass
 
 
+def run_6h_analysis(shared_store=None):
+    """
+    6-Hour Macro Re-analysis for Bitcoin (BTCUSD).
+    Called by main.py at 05:31, 11:31, 17:31, 23:31 IST (UTC-aligned closes).
+    """
+    if not _btc_lock.acquire(blocking=False):
+        return
+
+    try:
+        state = BtcState(shared_store)
+        now = datetime.now(IST)
+
+        df_15m = fetch_delta_candles(BTC_SYMBOL, "15m", hours_back=120, closed_only=True)
+        if df_15m.empty or len(df_15m) < 35:
+            return
+
+        df_15m = compute_indicators(df_15m)
+        ltp = float(df_15m["c"].iloc[-1])
+        ema50 = float(df_15m["ema50"].iloc[-1])
+        slope = float(df_15m["ema50_slope"].iloc[-1])
+        r_pct = float(df_15m["range_pct"].iloc[-1])
+        r_high = float(df_15m["roll_h96"].iloc[-1])
+        r_low = float(df_15m["roll_l96"].iloc[-1])
+        atr = float(df_15m["atr14"].iloc[-1])
+        pdh = float(df_15m["pdh"].iloc[-1]) if pd.notna(df_15m["pdh"].iloc[-1]) else 0.0
+        pdl = float(df_15m["pdl"].iloc[-1]) if pd.notna(df_15m["pdl"].iloc[-1]) else 0.0
+
+        zones = build_btc_zones(state, df_15m, ltp)
+        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
+
+        log.info(f"[BTC] ═════════ 6-HOUR MACRO RE-ANALYSIS ({now.strftime('%H:%M IST')}) ═════════")
+        log.info(f"[BTC] LTP: ${ltp:,.1f} | 50 EMA: ${ema50:,.1f} (Slope: {slope:+.1f}) | Trend: {trend_bias}")
+        log.info(f"[BTC] Active Zones ({len(zones)}): {', '.join([z['id'] for z in zones[:4]])}")
+
+        sys_p = (
+            "You are the Lead Institutional Crypto Trading Supervisor. "
+            "Provide a concise 1-2 sentence macro structure assessment for BTCUSD. "
+            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
+        )
+        usr_p = (
+            f"Asset: BTCUSD | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp}\n"
+            f"50 EMA: ${ema50:.1f} (Slope: {slope:+.1f}) | 48h Range: ${r_low:.0f} - ${r_high:.0f} (Pos: {r_pct:.1f}%)\n"
+            f"PDH: ${pdh:.1f} | PDL: ${pdl:.1f} | Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
+        )
+
+        ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
+        ai_text = (ai_res or {}).get("assessment", "Consolidation within macro range. Monitor 5M S3 box breakout or PDH/PDL sweeps.")
+        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
+
+        z_lines = [f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.1f}</code> ({esc(z['why'])})" for z in zones[:3]]
+
+        msg = f"""🏛️ <b>[BITCOIN] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
+
+📊 <b>LTP     :</b> <b>${ltp:,.1f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
+📐 <b>50 EMA :</b> <code>${ema50:,.1f}</code> (Slope: <code>{slope:+.1f}</code>)
+📏 <b>48h Rng :</b> <code>${r_low:,.0f} — ${r_high:,.0f}</code> (Pos: <code>{r_pct:.1f}%</code>)
+
+🗺️ <b>Active 15M Macro Zones:</b>
+{chr(10).join(z_lines)}
+
+🧠 <b>AI Macro Audit ({esc(provider)}):</b> [{esc(ai_bias)}]
+<i>{esc(ai_text)}</i>"""
+
+        tg_send(msg)
+        log.info(f"[BTC] 🏛️ 6-Hour Macro Re-analysis published to Telegram.")
+
+    except Exception:
+        log.exception("[BTC] Error in run_6h_analysis")
+    finally:
+        try:
+            _btc_lock.release()
+        except RuntimeError:
+            pass
+
+
 def run_btc_30m_tick(shared_store=None):
-    # Compatibility with main.py - we just call the cycle
     run_btc_cycle(shared_store)
 
 def run_btc_1m_tick(shared_store=None):
     run_btc_cycle(shared_store)
 
 if __name__ == "__main__":
-    log.info("[BTC] Starting Bitcoin Institutional Engine v8.3 on Koyeb...")
+    log.info("[BTC] Starting Bitcoin Institutional Engine v8.5 on Koyeb...")
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     state_init = BtcState()
