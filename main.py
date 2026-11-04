@@ -425,9 +425,9 @@ def main():
         log.info("Scheduled [SYSTEM] 5-Minute Multi-Asset Radar Heartbeat")
 
         # 2. NIFTY 50: Morning Bias (09:21) + 5-Minute Setup Scan + 1-Hour Macro Reanalysis
-        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_1h_analysis", tag="NIFTY", job_id="nifty_morning_bias", gate=is_nifty_morning_bias, label="Morning Bias Initialization (09:21)", day_of_week="mon-fri", hour=9, minute=21, second=0)
+        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="hourly_job", tag="NIFTY", job_id="nifty_morning_bias", gate=is_nifty_morning_bias, label="Morning Bias Initialization (09:21)", day_of_week="mon-fri", hour=9, minute=21, second=0)
         _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_nifty_1m_tick", tag="NIFTY", job_id="nifty_5m_engine", gate=is_nifty_open, label="5-Minute Setup Scan (09:20-15:30)", tick_key="NIFTY:last_tick", day_of_week="mon-fri", hour="9-15", minute="*/5", second=5)
-        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_1h_analysis", tag="NIFTY", job_id="nifty_1h_ai", gate=is_nifty_open, label="1-Hour Macro Reanalysis (10:15-15:15)", day_of_week="mon-fri", hour="10-15", minute=15, second=0)
+        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="hourly_job", tag="NIFTY", job_id="nifty_1h_ai", gate=is_nifty_open, label="1-Hour Macro Reanalysis (10:15-15:15)", day_of_week="mon-fri", hour="10-15", minute=15, second=0)
 
         # 3. BITCOIN: 5-Minute Execution Scan (24/7) + 6-Hour Macro Reanalysis (UTC-aligned closes: 05:31, 11:31, 17:31, 23:31 IST)
         _register(scheduler, store, enabled=ENABLE_BTC, module=btc_bot, func_name="run_btc_1m_tick", tag="BTC", job_id="btc_5m_engine", gate=is_btc_open, label="5-Minute Execution Scan (24/7)", tick_key="BTC:last_tick", minute="*/5", second=15)
