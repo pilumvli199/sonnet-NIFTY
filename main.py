@@ -1,10 +1,10 @@
 """
-MASTER ORCHESTRATOR (main.py) — NIFTY 50 + BITCOIN + GOLD V8.0 PRODUCTION
+MASTER ORCHESTRATOR (main.py) — NIFTY 50 + BITCOIN + GOLD V8.3 PRODUCTION
 Multi-Asset Cloud Launcher for Koyeb / Docker
 - Non-blocking Asynchronous Scheduler (Zero Thread Freezing)
 - 5-Minute Live Radar Heartbeat Monitor (Continuous Terminal Visibility)
 - Exact Gold Market Hours (Monday 03:30 AM to Saturday 02:30 AM IST)
-- Fail-Safe Health Checks & Diagnostics for Delta, Upstox, Gemini, Claude
+- Multi-TF Execution (15M Macro + 5M Precision)
 """
 
 import os
@@ -71,11 +71,11 @@ def is_gold_open(now=None) -> bool:
     if weekday == 6:
         return False
 
-    # Saturday: Open only until 02:30 AM IST (Summer EDT) / 03:30 AM IST (Winter EST)
+    # Saturday: Open only until 02:30 AM IST
     if weekday == 5:
         return t_min < (2 * 60 + 30)
 
-    # Monday: Opens at 03:30 AM IST (Summer EDT) / 04:30 AM IST (Winter EST)
+    # Monday: Opens at 03:30 AM IST
     if weekday == 0:
         return t_min >= (3 * 60 + 30)
 
@@ -214,7 +214,7 @@ def run_asset_radar_heartbeat(store):
     now_str = now.strftime("%H:%M:%S IST")
     h_log = logging.getLogger("HEARTBEAT")
 
-    # 1. BTC Live Status & Fetch Check
+    # 1. BTC Live Status
     btc_status = "Disabled"
     if ENABLE_BTC:
         try:
@@ -222,9 +222,11 @@ def run_asset_radar_heartbeat(store):
             if r.status_code == 200:
                 data = r.json().get("result", {})
                 close_p = float(data.get("close", 0.0))
-                next_min = 30 if now.minute < 30 else 0
-                next_h = now.hour if now.minute < 30 else (now.hour + 1) % 24
-                btc_status = f"LIVE OK (${close_p:,.1f}) | 30M Bar Scanning (Next: {next_h:02d}:{next_min:02d}:15)"
+                # 5M interval math for next scan
+                nxt_min = ((now.minute // 5) + 1) * 5
+                nxt_h = now.hour if nxt_min < 60 else (now.hour + 1) % 24
+                nxt_min = nxt_min % 60
+                btc_status = f"LIVE OK (${close_p:,.1f}) | 5M Bar Scanning (Next: {nxt_h:02d}:{nxt_min:02d}:15)"
             else:
                 btc_status = f"Delta HTTP {r.status_code}"
         except Exception as e:
@@ -247,7 +249,7 @@ def run_asset_radar_heartbeat(store):
     gold_status = "Disabled"
     if ENABLE_GOLD:
         if is_gold_open(now):
-            gold_status = "ACTIVE (30-Min Scanner Running)"
+            gold_status = "ACTIVE (5-Min Scanner Running)"
         else:
             if now.weekday() == 6:
                 gold_status = "Closed (Sunday) -> Opens Monday 03:30 IST"
@@ -270,7 +272,6 @@ def run_health_check():
     log.info("[SYSTEM] Running Health Check & API Validations...")
     res = {"Delta": "FAIL", "Upstox": "FAIL", "Gemini": "FAIL", "Claude": "Not Set (Optional)"}
 
-    # 1. Delta Exchange Check (Public Tickers endpoint - no start/end timestamps required)
     try:
         d_key = os.getenv("DELTA_API_KEY", "").strip()
         if "your_" in d_key.lower():
@@ -289,7 +290,6 @@ def run_health_check():
         log.warning(f"[HEALTH] Delta check failed: {e}")
         res["Delta"] = "FAIL (Connection Error)"
 
-    # 2. Upstox Check
     try:
         u_token = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
         if u_token and "your_" not in u_token.lower():
@@ -302,7 +302,6 @@ def run_health_check():
     except Exception as e:
         log.warning(f"[HEALTH] Upstox check failed: {e}")
 
-    # 3. Gemini Check (Supports active model from env with fallback)
     try:
         raw_keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",") if k.strip()]
         g_keys = [k for k in raw_keys if "your_" not in k.lower()]
@@ -335,7 +334,6 @@ def run_health_check():
         log.warning(f"[HEALTH] Gemini check exception: {e}")
         res["Gemini"] = "FAIL (Connection Error)"
 
-    # 4. Claude Check (Optional)
     try:
         a_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         if a_key and "your_" not in a_key.lower():
@@ -368,7 +366,7 @@ def run_health_check():
 
 
 def main():
-    log.info("Starting Multi-Asset Liquidity Hunt Orchestrator...")
+    log.info("Starting Multi-Asset Liquidity Hunt Orchestrator V8.3...")
 
     store = SharedNamespacedStore(REDIS_URL)
 
@@ -389,14 +387,16 @@ def main():
 
         # 2. NIFTY 50: 5-Minute Setup Scan + 1-Hour Macro Reanalysis
         _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_nifty_1m_tick", tag="NIFTY", job_id="nifty_5m_engine", gate=is_nifty_open, label="5-Minute Setup Scan (09:20-15:30)", day_of_week="mon-fri", hour="9-15", minute="*/5", second=5)
-        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_1h_analysis", tag="NIFTY", job_id="nifty_1h_ai", gate=is_nifty_open, label="1-Hour Macro Reanalysis (10:15-15:15)", day_of_week="mon-fri", hour="10,11,12,13,14,15", minute=15, second=0)
+        
+        # FIXED: run_1h_analysis function issue
+        _register(scheduler, store, enabled=ENABLE_NIFTY, module=nifty_bot, func_name="run_1h_analysis", tag="NIFTY", job_id="nifty_1h_ai", gate=is_nifty_open, label="1-Hour Macro Reanalysis", day_of_week="mon-fri", hour="9-15", minute=15, second=0)
 
-        # 3. BITCOIN: 30-Minute Closed Bar Scan (24/7) + 6-Hour Macro Reanalysis
-        _register(scheduler, store, enabled=ENABLE_BTC, module=btc_bot, func_name="run_btc_30m_tick", tag="BTC", job_id="btc_30m_engine", gate=is_btc_open, label="30-Minute Closed Bar Scan (24/7)", minute="0,30", second=15)
+        # 3. BITCOIN: 5-Minute Execution Scan (24/7) + 6-Hour Macro Reanalysis
+        _register(scheduler, store, enabled=ENABLE_BTC, module=btc_bot, func_name="run_btc_1m_tick", tag="BTC", job_id="btc_5m_engine", gate=is_btc_open, label="5-Minute Execution Scan (24/7)", minute="*/5", second=15)
         _register(scheduler, store, enabled=ENABLE_BTC, module=btc_bot, func_name="run_6h_analysis", tag="BTC", job_id="btc_6h_ai", gate=is_btc_open, label="6-Hour Macro Re-analysis (00,06,12,18)", hour="0,6,12,18", minute=1, second=0)
 
-        # 4. GOLD: 30-Minute Closed Bar Scan + 6-Hour Macro Reanalysis (Mon-Sat 02:30 AM)
-        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_gold_1m_tick", tag="GOLD", job_id="gold_30m_engine", gate=is_gold_open, label="30-Minute Closed Bar Scan (Mon-Sat 02:30 AM)", day_of_week="mon-sat", minute="0,30", second=35)
+        # 4. GOLD: 5-Minute Execution Scan + 6-Hour Macro Reanalysis (Mon-Sat)
+        _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_gold_1m_tick", tag="GOLD", job_id="gold_5m_engine", gate=is_gold_open, label="5-Minute Execution Scan (Mon-Sat)", day_of_week="mon-sat", minute="*/5", second=35)
         _register(scheduler, store, enabled=ENABLE_GOLD, module=gold_bot, func_name="run_6h_analysis", tag="GOLD", job_id="gold_6h_ai", gate=is_gold_open, label="6-Hour Macro Re-analysis (00,06,12,18)", day_of_week="mon-sat", hour="0,6,12,18", minute=2, second=0)
 
         scheduler.start()
@@ -407,7 +407,7 @@ def main():
 
         @app.route("/")
         def index():
-            return "Multi-Asset Liquidity Hunt V8.0 Running OK", 200
+            return "Multi-Asset Liquidity Hunt V8.3 Running OK", 200
 
         @app.route("/health")
         def health():
