@@ -1,22 +1,27 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   GOLD (XAUTUSD) INSTITUTIONAL TRADING ENGINE — V8.5 (MULTI-TF)          ║
+║   GOLD (XAUTUSD) INSTITUTIONAL TRADING ENGINE — V9.0 PURE PRICE ACTION   ║
 ║   Namespace: GOLD:* | Logger: [GOLD] | Delta Exchange Public API         ║
 ║   Timeframe: 5M Execution Engine | Multi-Asset Isolation Enabled         ║
 ║                                                                          ║
-║   TOP 6 PROVEN INSTITUTIONAL SETUPS INTEGRATED:                          ║
-║   1. 5M_VOLUME_EXPANSION_BLAST (1:3 RR - Tight Range + Vol Anomaly)      ║
-║   2. S3_BREAKOUT_LIQUIDITY_HUNT (1:3 RR - Wyckoff Pre-Sweep Blast)       ║
-║   3. LONDON_ASIAN_SWEEP (1:2 RR - London Open 12:30-16:30 Judas Swing)   ║
-║   4. USER_3SWING_INDUCEMENT_TRAP (1:2 RR - SMC Structural Inducement)    ║
-║   5. S3_BREAKOUT_OPT (1:3 RR - Trend Aligned Compression Breakout)       ║
-║   6. S2_PDH_PDL_SWEEP (1:2 RR - 0.7 ATR Buffer Daily Level Sweep)        ║
+║   100% PURE PRICE ACTION ARCHITECTURE (ZERO ATR DEPENDENCY):             ║
+║   1. 5M_VOLUME_EXPANSION_BLAST (Relative Body >= 2x + Fixed Box <= $9)   ║
+║   2. TREND_PULLBACK_RETEST (Catches Retests after Giant Breakouts)       ║
+║   3. PDH_PDL_MOMENTUM_BREAKOUT (Clean Daily Expansion with Vol >= 1.8x)  ║
+║   4. S2_PDH_PDL_SWEEP (30% Rejection Wick Trap Reversal — No Day Lock)   ║
+║   5. SESSION_RANGE_SWEEP (Asian/London Range Sweep Reversals)            ║
+║   6. USER_3SWING_INDUCEMENT_TRAP (SMC Structure — No 35-65% Deadzone)    ║
+║   7. S3_COMPRESSION_BREAKOUT (6-Bar Box Compression <= $9.00 Breakout)   ║
 ║                                                                          ║
-║   CORE SECURITY & STABILITY GUARDS:                                      ║
-║   • Multi-TF Sync: 15M Macro Structure + 5M Precision Execution          ║
-║   • 503 Retry Guard: 2.5s Sleep & Retry for Gemini Server Overload       ║
-║   • Fail-Closed AI Guard: If AI fails or times out, trade is BLOCKED     ║
-║   • Built-in HTTP Health Server (Port 8080 / $PORT) for UptimeRobot      ║
+║   RELAXED GUARDS & BOT STABILITY FIXES:                                  ║
+║   • No FOMO Block (3-Bar Chase Block Removed for Real Breakouts)         ║
+║   • Pullback Router: Giant candles (> $7.50) NOT skipped, routed to PB!  ║
+║   • Cooldown reduced from 240m to 35m for fast market continuation       ║
+║   • Honest AI Fallback: Never broadcasts fake default text if AI fails   ║
+║   • 24h Range Label Fixed (96 bars of 15m = 24 Hours)                    ║
+║   • Delta Error Logging uses {type(e).__name__} (Zero API Key Leak)      ║
+║   • Fail-Closed AI Guard + 503 Retry Guard (2.5s Sleep & Retry)          ║
+║   • Built-in HTTP Health Server (Port 8080 / $PORT) for Koyeb / Uptime   ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -48,11 +53,12 @@ TG_CHAT_ID          = os.getenv("GOLD_TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHA
 
 DELTA_BASE_URL      = os.getenv("DELTA_BASE_URL", "https://api.india.delta.exchange")
 DELTA_API_KEY       = os.getenv("DELTA_API_KEY", "").strip()
-if "your_" in DELTA_API_KEY.lower(): DELTA_API_KEY = ""
+if "your_" in DELTA_API_KEY.lower():
+    DELTA_API_KEY = ""
 GOLD_SYMBOL         = os.getenv("GOLD_SYMBOL", "XAUTUSD")
 PORT                = int(os.getenv("PORT", "8080"))
-WAIT_COOLDOWN_MIN   = int(os.getenv("GOLD_WAIT_COOLDOWN_MIN", "15"))
-SIGNAL_COOLDOWN_MIN = int(os.getenv("GOLD_SIGNAL_COOLDOWN_MIN", "240"))  # 4 Hours Cooldown
+WAIT_COOLDOWN_MIN   = int(os.getenv("GOLD_WAIT_COOLDOWN_MIN", "10"))
+SIGNAL_COOLDOWN_MIN = int(os.getenv("GOLD_SIGNAL_COOLDOWN_MIN", "35"))  # Relaxed from 240m to 35m
 GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
 CLAUDE_BACKUP_MODEL = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-4-5-20251001").strip()
 
@@ -105,14 +111,14 @@ class GoldState:
 
 
 # ==============================================================================
-# KOYEB HTTP HEALTH CHECK SERVER (FOR STANDALONE CONTAINER RUNS)
+# KOYEB HTTP HEALTH CHECK SERVER
 # ==============================================================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Gold (XAUTUSD) Institutional Engine v8.5 Active\n")
+        self.wfile.write(b"OK - Gold (XAUTUSD) Institutional Engine v9.0 Active\n")
 
     def log_message(self, format, *args):
         return
@@ -124,7 +130,7 @@ def start_health_server():
         log.info(f"[GOLD] Health Check HTTP server listening on port {PORT} for UptimeRobot")
         server.serve_forever()
     except Exception as e:
-        log.error(f"[GOLD] HTTP health server error: {e}")
+        log.error(f"[GOLD] HTTP health server error: {type(e).__name__}")
 
 
 # ==============================================================================
@@ -175,7 +181,7 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
                         if s != -1:
                             return json.loads(clean[s:e]), f"GEMINI ({GEMINI_MODEL})"
             except Exception as e:
-                log.warning(f"[GOLD] Gemini request error: {e}")
+                log.warning(f"[GOLD] Gemini request error: {type(e).__name__}")
 
     if ANTHROPIC_KEY:
         hdrs = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
@@ -190,7 +196,7 @@ def call_ai_json(system_prompt, user_prompt, max_tokens=700):
                 if s != -1:
                     return json.loads(clean[s:e]), f"CLAUDE_BACKUP ({CLAUDE_BACKUP_MODEL})"
         except Exception as e:
-            log.error(f"[GOLD] Claude backup error: {e}")
+            log.error(f"[GOLD] Claude backup error: {type(e).__name__}")
 
     return None, "AI_UNREACHABLE"
 
@@ -224,7 +230,7 @@ def fetch_delta_candles(symbol: str, resolution: str, hours_back: int, closed_on
                     df = df.iloc[:-1].reset_index(drop=True)
             return df
     except Exception as e:
-        log.error(f"[GOLD] Delta candle fetch error ({resolution}): {e}")
+        log.error(f"[GOLD] Delta candle fetch error ({resolution}): {type(e).__name__}")
     return pd.DataFrame()
 
 
@@ -240,26 +246,23 @@ def tg_send(text):
         )
         return r.status_code == 200
     except Exception as e:
-        log.error(f"[GOLD] Telegram error: {e}")
+        log.error(f"[GOLD] Telegram error: {type(e).__name__}")
         return False
 
 
 # ==============================================================================
-# TECHNICAL INDICATORS, ZONES & FRACTAL SWINGS
+# PURE PRICE ACTION INDICATORS & STRUCTURE
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame):
+    """Zero-ATR Indicator engine: EMA50, 24h Rolling Extremes (96 bars of 15M), and Daily PDH/PDL."""
     df_new = df.copy()
     high, low, close = df_new["h"], df_new["l"], df_new["c"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    df_new["atr14"] = tr.rolling(14).mean().bfill()
-    df_new["ema50"] = close.ewm(span=50, adjust=False).mean()
-    df_new["ema50_slope"] = df_new["ema50"] - df_new["ema50"].shift(12)
 
+    df_new["ema50"] = close.ewm(span=50, adjust=False).mean()
     df_new["roll_h96"] = high.rolling(96).max()
     df_new["roll_l96"] = low.rolling(96).min()
-    df_new["range_pct"] = (close - df_new["roll_l96"]) / (df_new["roll_h96"] - df_new["roll_l96"] + 1e-6) * 100
 
+    # Daily PDH / PDL (UTC Date aligned for Delta Exchange)
     df_new["utc_date"] = df_new["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%d")
     daily = df_new.groupby("utc_date").agg({"h": "max", "l": "min"}).shift(1)
     daily.columns = ["pdh", "pdl"]
@@ -280,12 +283,12 @@ def find_swings(df: pd.DataFrame, w=3):
 
 
 def build_gold_zones(state: GoldState, df_macro: pd.DataFrame, ltp: float):
+    """Maintains active_zones in GoldState using pure structural S/R ($25 window, $1.50 buffer)."""
     zones = []
     if df_macro.empty or len(df_macro) < 20:
         return zones
 
-    atr = float(df_macro["atr14"].iloc[-1]) if "atr14" in df_macro.columns else 4.0
-    dynamic_window = max(15.0, 3.0 * atr)
+    dynamic_window = 25.0  # Clean $25 window around LTP
 
     pdh = df_macro["pdh"].iloc[-1] if "pdh" in df_macro.columns else None
     pdl = df_macro["pdl"].iloc[-1] if "pdl" in df_macro.columns else None
@@ -311,315 +314,233 @@ def build_gold_zones(state: GoldState, df_macro: pd.DataFrame, ltp: float):
 
 
 # ==============================================================================
-# TOP 6 INSTITUTIONAL PATTERN DETECTORS (ON CLOSED 5M EXECUTION BAR)
+# TOP 7 PURE PRICE ACTION DETECTORS (ZERO ATR)
 # ==============================================================================
 
-# SETUP 1: 5M Volume Expansion Blast (Trend Aligned Breakout)
-def check_5m_volume_expansion(df_5m: pd.DataFrame, df_15m: pd.DataFrame):
+# SETUP 1: 5M Volume Expansion Blast (Relative Momentum + Fixed Box <= $9)
+def check_5m_volume_expansion(df_5m: pd.DataFrame, df_15m: pd.DataFrame, state: GoldState):
     if len(df_5m) < 20 or len(df_15m) < 10:
         return None
         
     i = len(df_5m) - 1
     c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
     v_curr = float(df_5m["v"].iloc[i])
-    
     v_avg = df_5m["v"].iloc[i-14:i].mean()
-    atr_5m = float(df_5m["atr14"].iloc[i])
     ema50_15m = float(df_15m["ema50"].iloc[-1])
     
-    box = df_5m.iloc[i - 6:i]
+    # 1. Relative Candle Body: Current Body >= 2x Avg of past 3 bodies
+    curr_body = abs(c - o)
+    prev_bodies = [abs(float(df_5m["c"].iloc[k]) - float(df_5m["o"].iloc[k])) for k in range(i-3, i)]
+    avg_prev_body = max(0.50, sum(prev_bodies) / 3.0)
+    is_momentum_body = (curr_body >= 2.0 * avg_prev_body)
+    
+    # 2. Fixed Compression Box: Past 6 bars <= $9.00 range
+    box = df_5m.iloc[i-6:i]
     box_h, box_l = float(box["h"].max()), float(box["l"].min())
     box_range = box_h - box_l
+    is_tight_box = (box_range <= 9.0)
     
-    if box_range <= 1.5 * atr_5m and v_curr > 3.5 * v_avg:
-        if c > box_h and c > ema50_15m and (c - o) > 0.8 * atr_5m:
-            sl = round(box_l, 2)
+    # 3. Volume Anomaly: >= 2.0x 14-period SMA
+    is_vol_anomaly = (v_curr >= 2.0 * v_avg)
+    
+    if is_tight_box and is_vol_anomaly and is_momentum_body:
+        # Bullish Breakout
+        if c > box_h and c > ema50_15m:
+            candle_risk = c - l
+            # If overextended (> $7.50), route to Trend Pullback watch!
+            if candle_risk > 7.50:
+                state.set("pullback_watch", {
+                    "action": "BUY_GOLD",
+                    "level": box_h,
+                    "breakout_high": h,
+                    "expires": time.time() + 1800
+                }, ttl=1800)
+                log.info(f"[GOLD] 📢 Giant Breakout (${candle_risk:.2f} > $7.50). Watching for TREND PULLBACK near ${box_h:.2f}!")
+                return None
+            
+            sl = round(min(l, box_l) - 0.50, 2)
             risk = max(1.50, round(c - sl, 2))
             return {
                 "name": "5M_VOLUME_EXPANSION_BLAST",
                 "action": "BUY_GOLD",
-                "tier": "A++ Institutional Breakout (+Volume Anomaly)",
+                "tier": "A++ Pure Momentum Breakout (Relative Body + Vol 2x)",
                 "entry": c,
                 "sl": sl,
                 "risk": risk,
-                "tp": round(c + 3.0 * risk, 2),
+                "tp": round(c + 2.0 * risk, 2),
                 "be": round(c + 1.0 * risk, 2),
-                "rr": "1:3.0",
-                "why": f"Tight box (${box_l:.2f}-${box_h:.2f}) exploded UP with 3.5x Volume Anomaly ({int(v_curr)} vol) aligned with 15M Trend."
+                "rr": "1:2.0",
+                "why": f"Fixed Box (${box_l:.2f}-${box_h:.2f}, rng ${box_range:.2f}) broke UP with body ${curr_body:.2f} ({curr_body/avg_prev_body:.1f}x) & {v_curr/v_avg:.1f}x Vol"
             }
             
-        if c < box_l and c < ema50_15m and (o - c) > 0.8 * atr_5m:
-            sl = round(box_h, 2)
+        # Bearish Breakdown
+        elif c < box_l and c < ema50_15m:
+            candle_risk = h - c
+            if candle_risk > 7.50:
+                state.set("pullback_watch", {
+                    "action": "SELL_GOLD",
+                    "level": box_l,
+                    "breakout_low": l,
+                    "expires": time.time() + 1800
+                }, ttl=1800)
+                log.info(f"[GOLD] 📢 Giant Breakdown (${candle_risk:.2f} > $7.50). Watching for TREND PULLBACK near ${box_l:.2f}!")
+                return None
+                
+            sl = round(max(h, box_h) + 0.50, 2)
             risk = max(1.50, round(sl - c, 2))
             return {
                 "name": "5M_VOLUME_EXPANSION_BLAST",
                 "action": "SELL_GOLD",
-                "tier": "A++ Institutional Breakout (+Volume Anomaly)",
+                "tier": "A++ Pure Momentum Breakout (Relative Body + Vol 2x)",
                 "entry": c,
                 "sl": sl,
                 "risk": risk,
-                "tp": round(c - 3.0 * risk, 2),
+                "tp": round(c - 2.0 * risk, 2),
                 "be": round(c - 1.0 * risk, 2),
-                "rr": "1:3.0",
-                "why": f"Tight box (${box_l:.2f}-${box_h:.2f}) exploded DOWN with 3.5x Volume Anomaly ({int(v_curr)} vol) aligned with 15M Trend."
+                "rr": "1:2.0",
+                "why": f"Fixed Box (${box_l:.2f}-${box_h:.2f}, rng ${box_range:.2f}) broke DOWN with body ${curr_body:.2f} ({curr_body/avg_prev_body:.1f}x) & {v_curr/v_avg:.1f}x Vol"
             }
             
     return None
 
-# SETUP 2: S3 Breakout + Pre-Breakout Liquidity Hunt (1:3 RR)
-def check_s3_breakout_liq_hunt(df: pd.DataFrame):
-    if len(df) < 15:
+# SETUP 2: TREND PULLBACK RETEST (Never Skip Overextended Moves!)
+def check_trend_pullback(df_5m: pd.DataFrame, df_15m: pd.DataFrame, state: GoldState):
+    if len(df_5m) < 10:
         return None
-    i = len(df) - 1
-    c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
-    prev_c = float(df["c"].iloc[i - 1])
-    atr = float(df["atr14"].iloc[i])
-    ema50 = float(df["ema50"].iloc[i])
-    slope = float(df["ema50_slope"].iloc[i])
-
-    box = df.iloc[i - 6:i]
-    box_h, box_l = float(box["h"].max()), float(box["l"].min())
-    box_range = box_h - box_l
-
-    if box_range > 1.35 * atr:
+        
+    pb_watch = state.get("pullback_watch")
+    if not pb_watch:
         return None
+        
+    if time.time() > pb_watch.get("expires", 0):
+        state.set("pullback_watch", None)
+        return None
+        
+    i = len(df_5m) - 1
+    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
+    prev_l = float(df_5m["l"].iloc[i-1])
+    prev_h = float(df_5m["h"].iloc[i-1])
+    level = float(pb_watch["level"])
+    action = pb_watch["action"]
+    
+    # Bullish Pullback: Retest of breakout level / previous low holds and closes green
+    if action == "BUY_GOLD":
+        if l <= pb_watch.get("breakout_high", level + 3.0) and (l <= level + 3.0 or l <= prev_l + 0.50) and c > o and (c - l) >= 1.0:
+            sl = round(min(l, prev_l) - 0.50, 2)
+            risk = max(1.50, round(c - sl, 2))
+            if risk <= 7.50:
+                state.set("pullback_watch", None)  # Retest complete!
+                return {
+                    "name": "TREND_PULLBACK_RETEST",
+                    "action": "BUY_GOLD",
+                    "tier": "A++ Institutional Retest Entry (Tight SL)",
+                    "entry": c,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp": round(c + 2.0 * risk, 2),
+                    "be": round(c + 1.0 * risk, 2),
+                    "rr": "1:2.0",
+                    "why": f"Retest of breakout level ${level:.2f} held! Rejection green close at ${c:.2f} with tight ${risk:.2f} risk"
+                }
 
-    recent_box = df.iloc[i - 4:i]
-    lower_grab = any((float(row["l"]) <= box_l + 0.1 * atr and (min(float(row["o"]), float(row["c"])) - float(row["l"])) >= 0.3 * max(float(row["h"]) - float(row["l"]), 0.1)) for _, row in recent_box.iterrows())
-    upper_grab = any((float(row["h"]) >= box_h - 0.1 * atr and (float(row["h"]) - max(float(row["o"]), float(row["c"]))) >= 0.3 * max(float(row["h"]) - float(row["l"]), 0.1)) for _, row in recent_box.iterrows())
-
-    if c > box_h and prev_c <= box_h and c > ema50 and slope > -0.05 * atr and lower_grab:
-        sl = round(box_l, 2)
-        risk = max(1.50, round(c - sl, 2))
-        return {
-            "name": "S3_BREAKOUT_LIQUIDITY_HUNT",
-            "action": "BUY_GOLD",
-            "tier": "A++ Institutional Pre-Sweep Blast",
-            "entry": c,
-            "sl": sl,
-            "risk": risk,
-            "tp": round(c + 3.0 * risk, 2),
-            "be": round(c + 1.0 * risk, 2),
-            "rr": "1:3.0",
-            "why": f"[Wyckoff Spring] Sellers trapped at ${box_l:.2f} before Gold broke UP above ${box_h:.2f}"
-        }
-
-    if c < box_l and prev_c >= box_l and c < ema50 and slope < 0.05 * atr and upper_grab:
-        sl = round(box_h, 2)
-        risk = max(1.50, round(sl - c, 2))
-        return {
-            "name": "S3_BREAKOUT_LIQUIDITY_HUNT",
-            "action": "SELL_GOLD",
-            "tier": "A++ Institutional Pre-Sweep Blast",
-            "entry": c,
-            "sl": sl,
-            "risk": risk,
-            "tp": round(c - 3.0 * risk, 2),
-            "be": round(c - 1.0 * risk, 2),
-            "rr": "1:3.0",
-            "why": f"[Upthrust Trap] Buyers trapped at ${box_h:.2f} before Gold broke DOWN below ${box_l:.2f}"
-        }
+    # Bearish Pullback: Retest of breakdown level / previous high holds and closes red
+    elif action == "SELL_GOLD":
+        if h >= pb_watch.get("breakout_low", level - 3.0) and (h >= level - 3.0 or h >= prev_h - 0.50) and c < o and (h - c) >= 1.0:
+            sl = round(max(h, prev_h) + 0.50, 2)
+            risk = max(1.50, round(sl - c, 2))
+            if risk <= 7.50:
+                state.set("pullback_watch", None)
+                return {
+                    "name": "TREND_PULLBACK_RETEST",
+                    "action": "SELL_GOLD",
+                    "tier": "A++ Institutional Retest Entry (Tight SL)",
+                    "entry": c,
+                    "sl": sl,
+                    "risk": risk,
+                    "tp": round(c - 2.0 * risk, 2),
+                    "be": round(c - 1.0 * risk, 2),
+                    "rr": "1:2.0",
+                    "why": f"Retest of breakdown level ${level:.2f} rejected! Red continuation close at ${c:.2f} with tight ${risk:.2f} risk"
+                }
 
     return None
 
-# SETUP 3: London Open Asian Range Sweep (Gold's #1 Institutional Trap) (1:2 RR)
-def check_london_asian_sweep(df: pd.DataFrame):
-    if len(df) < 20:
+# SETUP 3: PDH / PDL MOMENTUM BREAKOUT (Catches Clean Daily Level Expansions)
+def check_pdh_pdl_breakout(df_5m: pd.DataFrame, df_15m: pd.DataFrame, state: GoldState):
+    if len(df_5m) < 15:
         return None
-    i = len(df) - 1
-    bar_ts = df["ts"].iloc[i]
-    t_min = bar_ts.hour * 60 + bar_ts.minute
-
-    if not (750 <= t_min <= 990):
+        
+    i = len(df_5m) - 1
+    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
+    prev_c = float(df_5m["c"].iloc[i-1])
+    pdh, pdl = df_5m["pdh"].iloc[i], df_5m["pdl"].iloc[i]
+    if pd.isna(pdh) or pd.isna(pdl):
         return None
-
-    today_date = bar_ts.date()
-    asian_candles = df[
-        (df["ts"].dt.date == today_date)
-        & (df["ts"].dt.hour >= 5)
-        & ((df["ts"].dt.hour < 12) | ((df["ts"].dt.hour == 12) & (df["ts"].dt.minute < 30)))
-    ]
-    if len(asian_candles) < 6:
-        return None
-
-    asian_h = float(asian_candles["h"].max())
-    asian_l = float(asian_candles["l"].min())
-
-    c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
-    atr = float(df["atr14"].iloc[i])
-    c_range = max(h - l, 0.1)
-    upper_wick = (h - max(o, c)) / c_range
-    lower_wick = (min(o, c) - l) / c_range
-
-    if h > asian_h and c < asian_h and upper_wick >= 0.35 and c <= o:
-        sl = round(h + 0.5 * atr, 2)
-        risk = max(1.50, round(sl - c, 2))
-        return {
-            "name": "LONDON_ASIAN_SWEEP",
-            "action": "SELL_GOLD",
-            "tier": "A++ London Open Judas Swing Reversal (Gold Special)",
-            "entry": c,
-            "sl": sl,
-            "risk": risk,
-            "tp": round(c - 2.0 * risk, 2),
-            "be": round(c - 1.0 * risk, 2),
-            "rr": "1:2.0",
-            "why": f"Swept Asian High (${asian_h:.2f}) at London Open with {int(upper_wick*100)}% rejection wick & closed RED"
-        }
-
-    if l < asian_l and c > asian_l and lower_wick >= 0.35 and c >= o:
-        sl = round(l - 0.5 * atr, 2)
+    pdh, pdl = float(pdh), float(pdl)
+    
+    v_curr = float(df_5m["v"].iloc[i])
+    v_avg = df_5m["v"].iloc[i-14:i].mean()
+    ema50_15m = float(df_15m["ema50"].iloc[-1])
+    
+    curr_body = abs(c - o)
+    prev_bodies = [abs(float(df_5m["c"].iloc[k]) - float(df_5m["o"].iloc[k])) for k in range(i-3, i)]
+    avg_prev_body = max(0.50, sum(prev_bodies) / 3.0)
+    
+    # PDH Breakout (BUY)
+    if prev_c <= pdh and c > pdh and c > ema50_15m and curr_body >= 1.5 * avg_prev_body and v_curr >= 1.8 * v_avg:
+        candle_risk = c - l
+        if candle_risk > 7.50:
+            state.set("pullback_watch", {"action": "BUY_GOLD", "level": pdh, "breakout_high": h, "expires": time.time() + 1800}, ttl=1800)
+            log.info(f"[GOLD] 📢 Giant PDH Breakout (${candle_risk:.2f} > $7.50). Watching for TREND PULLBACK at PDH ${pdh:.2f}!")
+            return None
+            
+        sl = round(max(l - 0.50, pdh - 1.00), 2)
         risk = max(1.50, round(c - sl, 2))
         return {
-            "name": "LONDON_ASIAN_SWEEP",
+            "name": "PDH_MOMENTUM_BREAKOUT",
             "action": "BUY_GOLD",
-            "tier": "A++ London Open Judas Swing Reversal (Gold Special)",
+            "tier": "A+ Daily High Expansion (Pure Momentum)",
             "entry": c,
             "sl": sl,
             "risk": risk,
             "tp": round(c + 2.0 * risk, 2),
             "be": round(c + 1.0 * risk, 2),
             "rr": "1:2.0",
-            "why": f"Swept Asian Low (${asian_l:.2f}) at London Open with {int(lower_wick*100)}% absorption wick & closed GREEN"
+            "why": f"Clean close above Previous Day High (${pdh:.2f}) with {v_curr/v_avg:.1f}x Vol & ${curr_body:.2f} body"
         }
 
-    return None
-
-# SETUP 4: User 3-Swing Inducement Trap (SMC Structure) (1:2 RR)
-def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
-    if len(df) < 30:
-        return None
-    i = len(df) - 1
-    c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
-    atr = float(df["atr14"].iloc[i])
-    c_range = max(h - l, 0.1)
-    upper_wick = (h - max(o, c)) / c_range
-    lower_wick = (min(o, c) - l) / c_range
-    range_pct = float(df["range_pct"].iloc[i])
-    slope = float(df["ema50_slope"].iloc[i])
-
-    if upper_wick >= 0.38 and c <= o and range_pct >= 65.0 and slope <= 0.25 * atr:
-        recent_sh = [s for s in sw_h if s["idx"] <= i - 3]
-        if len(recent_sh) >= 2:
-            for idx_2 in range(len(recent_sh) - 1, max(-1, len(recent_sh) - 8), -1):
-                s2 = recent_sh[idx_2]
-                gap2 = i - s2["idx"]
-                if not (6 <= gap2 <= 55) or not (h > s2["price"] and c < s2["price"]):
-                    continue
-                for idx_1 in range(idx_2 - 1, max(-1, idx_2 - 8), -1):
-                    s1 = recent_sh[idx_1]
-                    gap1 = s2["idx"] - s1["idx"]
-                    if not (8 <= gap1 <= 60):
-                        continue
-                    if s2["price"] < s1["price"] and h < (s1["price"] + 0.3 * atr):
-                        sl = round(h + 0.7 * atr, 2)
-                        risk = max(1.50, round(sl - c, 2))
-                        return {
-                            "name": "USER_3SWING_INDUCEMENT_TRAP",
-                            "action": "SELL_GOLD",
-                            "tier": "A+ Structural Inducement Trap (50% Win Rate)",
-                            "entry": c,
-                            "sl": sl,
-                            "risk": risk,
-                            "tp": round(c - 2.0 * risk, 2),
-                            "be": round(c - 1.0 * risk, 2),
-                            "rr": "1:2.0",
-                            "why": f"Swept Inducement High (${s2['price']:.2f}) below Major High (${s1['price']:.2f}) with Red rejection close"
-                        }
-
-    if lower_wick >= 0.38 and c >= o and range_pct <= 35.0 and slope >= -0.25 * atr:
-        recent_sl = [s for s in sw_l if s["idx"] <= i - 3]
-        if len(recent_sl) >= 2:
-            for idx_2 in range(len(recent_sl) - 1, max(-1, len(recent_sl) - 8), -1):
-                s2 = recent_sl[idx_2]
-                gap2 = i - s2["idx"]
-                if not (6 <= gap2 <= 55) or not (l < s2["price"] and c > s2["price"]):
-                    continue
-                for idx_1 in range(idx_2 - 1, max(-1, idx_2 - 8), -1):
-                    s1 = recent_sl[idx_1]
-                    gap1 = s2["idx"] - s1["idx"]
-                    if not (8 <= gap1 <= 60):
-                        continue
-                    if s2["price"] > s1["price"] and l > (s1["price"] - 0.3 * atr):
-                        sl = round(l - 0.7 * atr, 2)
-                        risk = max(1.50, round(c - sl, 2))
-                        return {
-                            "name": "USER_3SWING_INDUCEMENT_TRAP",
-                            "action": "BUY_GOLD",
-                            "tier": "A+ Structural Inducement Trap (50% Win Rate)",
-                            "entry": c,
-                            "sl": sl,
-                            "risk": risk,
-                            "tp": round(c + 2.0 * risk, 2),
-                            "be": round(c + 1.0 * risk, 2),
-                            "rr": "1:2.0",
-                            "why": f"Swept Inducement Low (${s2['price']:.2f}) above Major Low (${s1['price']:.2f}) with Green absorption close"
-                        }
-
-    return None
-
-# SETUP 5: S3 Breakout Trend Aligned (Clean Momentum) (1:3 RR)
-def check_s3_breakout_opt(df: pd.DataFrame):
-    if len(df) < 15:
-        return None
-    i = len(df) - 1
-    c = float(df["c"].iloc[i])
-    prev_c = float(df["c"].iloc[i - 1])
-    atr = float(df["atr14"].iloc[i])
-    ema50 = float(df["ema50"].iloc[i])
-    slope = float(df["ema50_slope"].iloc[i])
-
-    box = df.iloc[i - 6:i]
-    box_h, box_l = float(box["h"].max()), float(box["l"].min())
-    box_range = box_h - box_l
-
-    if box_range > 1.35 * atr:
-        return None
-
-    if c > box_h and prev_c <= box_h and c > ema50 and slope > -0.05 * atr:
-        sl = round(box_l, 2)
-        risk = max(1.50, round(c - sl, 2))
-        return {
-            "name": "S3_BREAKOUT_OPT",
-            "action": "BUY_GOLD",
-            "tier": "A Trend Aligned Compression Breakout",
-            "entry": c,
-            "sl": sl,
-            "risk": risk,
-            "tp": round(c + 3.0 * risk, 2),
-            "be": round(c + 1.0 * risk, 2),
-            "rr": "1:3.0",
-            "why": f"6-Bar box broke UP above ${box_h:.2f} aligned with 50 EMA trend"
-        }
-
-    if c < box_l and prev_c >= box_l and c < ema50 and slope < 0.05 * atr:
-        sl = round(box_h, 2)
+    # PDL Breakdown (SELL)
+    if prev_c >= pdl and c < pdl and c < ema50_15m and curr_body >= 1.5 * avg_prev_body and v_curr >= 1.8 * v_avg:
+        candle_risk = h - c
+        if candle_risk > 7.50:
+            state.set("pullback_watch", {"action": "SELL_GOLD", "level": pdl, "breakout_low": l, "expires": time.time() + 1800}, ttl=1800)
+            log.info(f"[GOLD] 📢 Giant PDL Breakdown (${candle_risk:.2f} > $7.50). Watching for TREND PULLBACK at PDL ${pdl:.2f}!")
+            return None
+            
+        sl = round(min(h + 0.50, pdl + 1.00), 2)
         risk = max(1.50, round(sl - c, 2))
         return {
-            "name": "S3_BREAKOUT_OPT",
+            "name": "PDL_MOMENTUM_BREAKOUT",
             "action": "SELL_GOLD",
-            "tier": "A Trend Aligned Compression Breakdown",
+            "tier": "A+ Daily Low Expansion (Pure Momentum)",
             "entry": c,
             "sl": sl,
             "risk": risk,
-            "tp": round(c - 3.0 * risk, 2),
+            "tp": round(c - 2.0 * risk, 2),
             "be": round(c - 1.0 * risk, 2),
-            "rr": "1:3.0",
-            "why": f"6-Bar box broke DOWN below ${box_l:.2f} aligned with 50 EMA trend"
+            "rr": "1:2.0",
+            "why": f"Clean close below Previous Day Low (${pdl:.2f}) with {v_curr/v_avg:.1f}x Vol & ${curr_body:.2f} body"
         }
 
     return None
 
-# SETUP 6: S2 PDH / PDL Sweep (With 0.7 ATR Buffer & 1-Per-Day Limit) (1:2 RR)
+# SETUP 4: S2 PDH / PDL Sweep (Trap Reversals — 30% Wick, No 1-per-day restriction)
 def check_s2_pdh_pdl_sweep(df: pd.DataFrame, state: GoldState):
     if len(df) < 15:
         return None
     i = len(df) - 1
     c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
-    atr = float(df["atr14"].iloc[i])
-    slope = float(df["ema50_slope"].iloc[i])
     pdh, pdl = df["pdh"].iloc[i], df["pdl"].iloc[i]
-    d_key = str(df["utc_date"].iloc[i])
 
     if pd.isna(pdh) or pd.isna(pdl):
         return None
@@ -629,65 +550,239 @@ def check_s2_pdh_pdl_sweep(df: pd.DataFrame, state: GoldState):
     upper_wick = (h - max(o, c)) / c_range
     lower_wick = (min(o, c) - l) / c_range
 
-    if not state.get(f"s2_taken_{d_key}_PDH"):
-        if h > pdh and c < pdh and upper_wick >= 0.35 and c <= o and slope <= 0.25 * atr:
-            sl = round(h + 0.7 * atr, 2)
-            risk = max(1.50, round(sl - c, 2))
+    # PDH Sweep Reversal (Short)
+    if h > pdh and c < pdh and upper_wick >= 0.30 and c <= o:
+        sl = round(h + 0.50, 2)
+        risk = max(1.50, round(sl - c, 2))
+        if risk <= 7.50:
             return {
                 "name": "S2_PDH_SWEEP",
                 "action": "SELL_GOLD",
-                "tier": "Tier-1 PDH Sweep (0.7 ATR Safe Buffer)",
+                "tier": "Tier-1 PDH Sweep Trap (30% Rejection Wick)",
                 "entry": c,
                 "sl": sl,
                 "risk": risk,
                 "tp": round(c - 2.0 * risk, 2),
                 "be": round(c - 1.0 * risk, 2),
                 "rr": "1:2.0",
-                "s2_daily_key": f"s2_taken_{d_key}_PDH",
                 "why": f"Swept Previous Day High (${pdh:.2f}) with {int(upper_wick*100)}% rejection wick and closed RED"
             }
 
-    if not state.get(f"s2_taken_{d_key}_PDL"):
-        if l < pdl and c > pdl and lower_wick >= 0.35 and c >= o and slope >= -0.25 * atr:
-            sl = round(l - 0.7 * atr, 2)
-            risk = max(1.50, round(c - sl, 2))
+    # PDL Sweep Reversal (Long)
+    if l < pdl and c > pdl and lower_wick >= 0.30 and c >= o:
+        sl = round(l - 0.50, 2)
+        risk = max(1.50, round(c - sl, 2))
+        if risk <= 7.50:
             return {
                 "name": "S2_PDL_SWEEP",
                 "action": "BUY_GOLD",
-                "tier": "Tier-1 PDL Sweep (0.7 ATR Safe Buffer)",
+                "tier": "Tier-1 PDL Sweep Trap (30% Absorption Wick)",
                 "entry": c,
                 "sl": sl,
                 "risk": risk,
                 "tp": round(c + 2.0 * risk, 2),
                 "be": round(c + 1.0 * risk, 2),
                 "rr": "1:2.0",
-                "s2_daily_key": f"s2_taken_{d_key}_PDL",
                 "why": f"Swept Previous Day Low (${pdl:.2f}) with {int(lower_wick*100)}% absorption wick and closed GREEN"
+            }
+
+    return None
+
+# SETUP 5: SESSION RANGE SWEEP (Judas Swing Reversal across Sessions)
+def check_session_range_sweep(df: pd.DataFrame):
+    if len(df) < 20:
+        return None
+    i = len(df) - 1
+    bar_ts = df["ts"].iloc[i]
+    today_date = bar_ts.date()
+
+    # Lookback past session bars from today
+    prior_session_candles = df[(df["ts"].dt.date == today_date) & (df["ts"] < bar_ts - pd.Timedelta(hours=1))]
+    if len(prior_session_candles) < 6:
+        return None
+
+    sess_h = float(prior_session_candles["h"].max())
+    sess_l = float(prior_session_candles["l"].min())
+
+    c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
+    c_range = max(h - l, 0.1)
+    upper_wick = (h - max(o, c)) / c_range
+    lower_wick = (min(o, c) - l) / c_range
+
+    if h > sess_h and c < sess_h and upper_wick >= 0.30 and c <= o:
+        sl = round(h + 0.50, 2)
+        risk = max(1.50, round(sl - c, 2))
+        if risk <= 7.50:
+            return {
+                "name": "SESSION_RANGE_SWEEP",
+                "action": "SELL_GOLD",
+                "tier": "A++ Session Range Sweep Reversal",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c - 2.0 * risk, 2),
+                "be": round(c - 1.0 * risk, 2),
+                "rr": "1:2.0",
+                "why": f"Swept Prior Session High (${sess_h:.2f}) with {int(upper_wick*100)}% rejection wick & closed RED"
+            }
+
+    if l < sess_l and c > sess_l and lower_wick >= 0.30 and c >= o:
+        sl = round(l - 0.50, 2)
+        risk = max(1.50, round(c - sl, 2))
+        if risk <= 7.50:
+            return {
+                "name": "SESSION_RANGE_SWEEP",
+                "action": "BUY_GOLD",
+                "tier": "A++ Session Range Sweep Reversal",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c + 2.0 * risk, 2),
+                "be": round(c + 1.0 * risk, 2),
+                "rr": "1:2.0",
+                "why": f"Swept Prior Session Low (${sess_l:.2f}) with {int(lower_wick*100)}% absorption wick & closed GREEN"
+            }
+
+    return None
+
+# SETUP 6: USER 3-SWING INDUCEMENT TRAP (SMC Structure — Relaxed Gaps, No Range% Deadzone)
+def check_user_3swing_inducement(df: pd.DataFrame, sw_h, sw_l):
+    if len(df) < 30:
+        return None
+    i = len(df) - 1
+    c, o, h, l = float(df["c"].iloc[i]), float(df["o"].iloc[i]), float(df["h"].iloc[i]), float(df["l"].iloc[i])
+    c_range = max(h - l, 0.1)
+    upper_wick = (h - max(o, c)) / c_range
+    lower_wick = (min(o, c) - l) / c_range
+
+    if upper_wick >= 0.30 and c <= o:
+        recent_sh = [s for s in sw_h if s["idx"] <= i - 2]
+        if len(recent_sh) >= 2:
+            for idx_2 in range(len(recent_sh) - 1, max(-1, len(recent_sh) - 8), -1):
+                s2 = recent_sh[idx_2]
+                gap2 = i - s2["idx"]
+                if not (3 <= gap2 <= 80) or not (h > s2["price"] and c < s2["price"]):
+                    continue
+                for idx_1 in range(idx_2 - 1, max(-1, idx_2 - 8), -1):
+                    s1 = recent_sh[idx_1]
+                    gap1 = s2["idx"] - s1["idx"]
+                    if not (3 <= gap1 <= 80):
+                        continue
+                    if s2["price"] < s1["price"] and h < (s1["price"] + 2.0):
+                        sl = round(h + 0.50, 2)
+                        risk = max(1.50, round(sl - c, 2))
+                        if risk <= 7.50:
+                            return {
+                                "name": "USER_3SWING_INDUCEMENT_TRAP",
+                                "action": "SELL_GOLD",
+                                "tier": "A+ Structural Inducement Trap (SMC)",
+                                "entry": c,
+                                "sl": sl,
+                                "risk": risk,
+                                "tp": round(c - 2.0 * risk, 2),
+                                "be": round(c - 1.0 * risk, 2),
+                                "rr": "1:2.0",
+                                "why": f"Swept Inducement High (${s2['price']:.2f}) below Major High (${s1['price']:.2f}) with Red rejection close"
+                            }
+
+    if lower_wick >= 0.30 and c >= o:
+        recent_sl = [s for s in sw_l if s["idx"] <= i - 2]
+        if len(recent_sl) >= 2:
+            for idx_2 in range(len(recent_sl) - 1, max(-1, len(recent_sl) - 8), -1):
+                s2 = recent_sl[idx_2]
+                gap2 = i - s2["idx"]
+                if not (3 <= gap2 <= 80) or not (l < s2["price"] and c > s2["price"]):
+                    continue
+                for idx_1 in range(idx_2 - 1, max(-1, idx_2 - 8), -1):
+                    s1 = recent_sl[idx_1]
+                    gap1 = s2["idx"] - s1["idx"]
+                    if not (3 <= gap1 <= 80):
+                        continue
+                    if s2["price"] > s1["price"] and l > (s1["price"] - 2.0):
+                        sl = round(l - 0.50, 2)
+                        risk = max(1.50, round(c - sl, 2))
+                        if risk <= 7.50:
+                            return {
+                                "name": "USER_3SWING_INDUCEMENT_TRAP",
+                                "action": "BUY_GOLD",
+                                "tier": "A+ Structural Inducement Trap (SMC)",
+                                "entry": c,
+                                "sl": sl,
+                                "risk": risk,
+                                "tp": round(c + 2.0 * risk, 2),
+                                "be": round(c + 1.0 * risk, 2),
+                                "rr": "1:2.0",
+                                "why": f"Swept Inducement Low (${s2['price']:.2f}) above Major Low (${s1['price']:.2f}) with Green absorption close"
+                            }
+
+    return None
+
+# SETUP 7: S3 COMPRESSION BREAKOUT (Fixed Box <= $9.00 Breakout)
+def check_s3_breakout_opt(df: pd.DataFrame, df_15m: pd.DataFrame):
+    if len(df) < 15:
+        return None
+    i = len(df) - 1
+    c = float(df["c"].iloc[i])
+    prev_c = float(df["c"].iloc[i - 1])
+    ema50 = float(df_15m["ema50"].iloc[-1])
+
+    box = df.iloc[i - 6:i]
+    box_h, box_l = float(box["h"].max()), float(box["l"].min())
+    box_range = box_h - box_l
+
+    if box_range > 9.00:
+        return None
+
+    if c > box_h and prev_c <= box_h and c > ema50:
+        sl = round(box_l - 0.50, 2)
+        risk = max(1.50, round(c - sl, 2))
+        if risk <= 7.50:
+            return {
+                "name": "S3_BREAKOUT_OPT",
+                "action": "BUY_GOLD",
+                "tier": "A Trend Aligned Compression Breakout",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c + 2.0 * risk, 2),
+                "be": round(c + 1.0 * risk, 2),
+                "rr": "1:2.0",
+                "why": f"6-Bar box (${box_l:.2f}-${box_h:.2f}, rng ${box_range:.2f}) broke UP above ${box_h:.2f} with trend"
+            }
+
+    if c < box_l and prev_c >= box_l and c < ema50:
+        sl = round(box_h + 0.50, 2)
+        risk = max(1.50, round(sl - c, 2))
+        if risk <= 7.50:
+            return {
+                "name": "S3_BREAKOUT_OPT",
+                "action": "SELL_GOLD",
+                "tier": "A Trend Aligned Compression Breakdown",
+                "entry": c,
+                "sl": sl,
+                "risk": risk,
+                "tp": round(c - 2.0 * risk, 2),
+                "be": round(c - 1.0 * risk, 2),
+                "rr": "1:2.0",
+                "why": f"6-Bar box (${box_l:.2f}-${box_h:.2f}, rng ${box_range:.2f}) broke DOWN below ${box_l:.2f} with trend"
             }
 
     return None
 
 
 # ==============================================================================
-# DETERMINISTIC RISK, FOMO & EMA50 HEADROOM AUDIT (FOR GOLD)
+# PURE PRICE ACTION RISK AUDIT (NO ATR CHOKES, NO 3-BAR FOMO BLOCK)
 # ==============================================================================
 def run_deterministic_filters(df: pd.DataFrame, setup: dict):
     i = len(df) - 1
     c = float(df["c"].iloc[i])
-    atr = float(df["atr14"].iloc[i])
     ema50 = float(df["ema50"].iloc[i])
     risk = float(setup["risk"])
 
-    if risk > 3.0 * atr:
-        log.info(f"[GOLD] Blocked {setup['name']}: Bloated Risk (${risk:.2f} > 3.0x ATR ${3.0*atr:.2f})")
+    # Hard Cap: Max Risk Cap $8.50 (Prevents runaway bloated SL)
+    if risk > 8.50:
+        log.info(f"[GOLD] Blocked {setup['name']}: Bloated Risk (${risk:.2f} > $8.50 cap)")
         return False, "Bloated Risk"
-
-    if i >= 3:
-        open_3 = float(df["o"].iloc[i - 3])
-        run_up = (c - open_3) if setup["action"] == "BUY_GOLD" else (open_3 - c)
-        if run_up > 3.5 * atr:
-            log.info(f"[GOLD] Blocked {setup['name']}: 3-Bar FOMO Chase (${run_up:.2f} > 3.5x ATR)")
-            return False, "FOMO Chase"
 
     ema_note = f"Clear (50 EMA at ${ema50:.2f})"
     if setup["action"] == "BUY_GOLD" and c < ema50 and (ema50 - c) < risk:
@@ -720,7 +815,7 @@ def run_startup_diagnostics(state: GoldState):
     state.set("diag_test", True, ttl=60)
     state_status = "OK" if state.get("diag_test") else "ERROR"
 
-    startup_msg = f"""🚀 <b>[SYSTEM INITIALIZATION COMPLETE]</b>
+    startup_msg = f"""🚀 <b>[GOLD PURE PRICE ACTION V9.0 ONLINE]</b>
 📅 <b>Time:</b> <code>{now.strftime('%Y-%m-%d %H:%M:%S IST')}</code> | <b>Server:</b> <code>Koyeb</code>
 
 🟢 <b>Delta Public API:</b> <code>{delta_status} (LTP: ${ltp_test:,.2f} | {delta_lat}ms)</code>
@@ -728,15 +823,16 @@ def run_startup_diagnostics(state: GoldState):
 🟢 <b>State Cache     :</b> <code>{state_status}</code>
 🟢 <b>HTTP Health Check:</b> <code>RUNNING (Port {PORT} - UptimeRobot Ready)</code>
 
-🎯 <b>Active Core Setups (Top 6 Multi-TF):</b>
-- <code>5M_VOLUME_EXPANSION_BLAST</code> (Tight Range + Vol Spike)
-- <code>S3_BREAKOUT_LIQUIDITY_HUNT</code> (1:3 RR)
-- <code>LONDON_ASIAN_SWEEP</code> (12:30 - 16:30 IST)
-- <code>USER_3SWING_INDUCEMENT_TRAP</code> (1:2 RR)
-- <code>S3_BREAKOUT_OPT</code> (1:3 RR)
-- <code>S2_PDH_PDL_SWEEP</code> (1:2 RR)
+🎯 <b>Active Pure Price Action Setups (Zero ATR):</b>
+- <code>5M_VOLUME_EXPANSION_BLAST</code> (Relative Body >= 2x + Box <= $9)
+- <code>TREND_PULLBACK_RETEST</code> (Catches Retests after Giant Moves)
+- <code>PDH_PDL_MOMENTUM_BREAKOUT</code> (Clean Daily Level Expansion)
+- <code>S2_PDH_PDL_SWEEP</code> (30% Rejection Wick Trap)
+- <code>SESSION_RANGE_SWEEP</code> (Session Judas Swing Reversals)
+- <code>USER_3SWING_INDUCEMENT_TRAP</code> (SMC Inducement Sweep)
+- <code>S3_BREAKOUT_OPT</code> (6-Bar Box Compression <= $9.00)
 
-🛡️ <i>Fail-Closed AI Guard & 503 Retry active.</i>"""
+🛡️ <i>Fail-Closed AI Guard + Pullback Router Active (No Skipped Moves).</i>"""
 
     tg_send(startup_msg)
     log.info("[GOLD] ✅ Startup diagnostics complete and report pushed to Telegram.")
@@ -760,15 +856,15 @@ def check_daily_0915_health_report(state: GoldState, df_15m: pd.DataFrame):
 
 📊 <b>Engine Status:</b>
 - AI Calls Today   : <code>{_daily_ai_call_count} / 500 Calls</code>
-- 5M Surveillance  : <code>ACTIVE (Closed-bar execution)</code>
+- 5M Surveillance  : <code>ACTIVE (Pure Price Action Zero ATR)</code>
 - Uptime Server    : <code>Port {PORT} (200 OK)</code>
 
 🗺️ <b>Macro Context (15M):</b>
-- GOLD LTP: <b>${ltp:,.2f}</b>
-- 50 EMA  : <b>${ema50:,.2f}</b> ({'Bullish' if ltp > ema50 else 'Bearish'})
+- GOLD LTP : <b>${ltp:,.2f}</b>
+- 50 EMA   : <b>${ema50:,.2f}</b> ({'Bullish' if ltp > ema50 else 'Bearish'})
 - PDH / PDL: <b>${pdh:,.2f} / ${pdl:,.2f}</b>
 
-✅ <i>All 6 Multi-TF setups active.</i>"""
+✅ <i>All 7 Pure Price Action setups active.</i>"""
         tg_send(daily_msg)
 
 
@@ -787,39 +883,43 @@ def check_6h_macro_reanalysis(state: GoldState, df_15m: pd.DataFrame):
         _last_macro_reanalysis_slot = cur_slot
         ltp = float(df_15m.iloc[-1]["c"]) if not df_15m.empty else 0.0
         ema50 = float(df_15m["ema50"].iloc[-1]) if "ema50" in df_15m.columns else 0.0
-        r_pct = float(df_15m["range_pct"].iloc[-1]) if "range_pct" in df_15m.columns else 50.0
-
-        log.info(f"[GOLD] ═════════ [6-HOUR MACRO RE-ANALYSIS: {now.strftime('%H:%M IST')}] ═════════")
-        log.info(f"[GOLD] LTP: ${ltp:.2f} | 50 EMA: ${ema50:.2f} | 48h Range Percentile: {r_pct:.1f}%")
-        log.info("[GOLD] Active Setups Refreshed. Next re-analysis in 6 Hours.")
-
-        zones = build_gold_zones(state, df_15m, ltp)
-        slope = float(df_15m["ema50_slope"].iloc[-1])
         r_high = float(df_15m["roll_h96"].iloc[-1])
         r_low = float(df_15m["roll_l96"].iloc[-1])
-        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
+        trend_bias = "BULLISH" if ltp > ema50 else "BEARISH"
+
+        log.info(f"[GOLD] ═════════ [6-HOUR MACRO RE-ANALYSIS: {now.strftime('%H:%M IST')}] ═════════")
+        log.info(f"[GOLD] LTP: ${ltp:.2f} | 50 EMA: ${ema50:.2f} | 24h Range: ${r_low:.2f} - ${r_high:.2f}")
+
+        zones = build_gold_zones(state, df_15m, ltp)
 
         sys_p = (
             "You are the Lead Institutional Gold (XAUUSD) Trading Supervisor. "
             "Provide a concise 1-2 sentence macro structure assessment for Gold. "
-            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
+            'Respond strictly in JSON: {"macro_bias": "BULLISH/BEARISH/NEUTRAL", "assessment": "1-2 sentences"}'
         )
         usr_p = (
             f"Asset: GOLD (XAUTUSD) | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp:.2f}\n"
-            f"50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | 48h Range: ${r_low:.2f} - ${r_high:.2f} (Pos: {r_pct:.1f}%)\n"
+            f"50 EMA: ${ema50:.2f} (Trend: {trend_bias}) | 24h Range: ${r_low:.2f} - ${r_high:.2f}\n"
             f"Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
         )
         ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
-        ai_text = (ai_res or {}).get("assessment", "Gold consolidating within key macro liquidity boundaries. Monitor London session sweeps.")
-        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
+
+        # Honest AI Fallback: Do not send fake broadcast if AI fails
+        if not ai_res:
+            log.warning(f"[GOLD] ⚠️ 6-Hour Macro AI failed ({provider}) — skipping Telegram broadcast to avoid misleading fallback.")
+            return
+
+        ai_text = ai_res.get("assessment", "Gold consolidating within key macro liquidity boundaries.")
+        ai_bias = ai_res.get("macro_bias", trend_bias)
+        state.set("macro_bias", ai_bias, ttl=21600)
 
         z_lines = [f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.2f}</code> ({esc(z['why'])})" for z in zones[:3]]
 
         msg = f"""🏛️ <b>[GOLD] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
 
 📊 <b>LTP     :</b> <b>${ltp:,.2f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
-📐 <b>50 EMA :</b> <code>${ema50:,.2f}</code> (Slope: <code>{slope:+.2f}</code>)
-📏 <b>48h Rng :</b> <code>${r_low:,.1f} — ${r_high:,.1f}</code> (Pos: <code>{r_pct:.1f}%</code>)
+📐 <b>50 EMA :</b> <code>${ema50:.2f}</code>
+📏 <b>24h Rng :</b> <code>${r_low:,.1f} — ${r_high:,.1f}</code>
 
 🗺️ <b>Active 15M Macro Zones:</b>
 {chr(10).join(z_lines)}
@@ -834,6 +934,7 @@ def check_6h_macro_reanalysis(state: GoldState, df_15m: pd.DataFrame):
 # ==============================================================================
 def run_gold_cycle(shared_store=None):
     if not _gold_lock.acquire(blocking=False):
+        log.warning("[GOLD] Execution lock busy, skipping cycle")
         return
 
     try:
@@ -845,6 +946,7 @@ def run_gold_cycle(shared_store=None):
         df_5m = fetch_delta_candles(GOLD_SYMBOL, "5m", hours_back=24, closed_only=True)
         
         if df_5m.empty or len(df_5m) < 35 or df_15m.empty:
+            log.warning("[GOLD] Insufficient candle data from Delta Exchange")
             return
 
         df_15m = compute_indicators(df_15m)
@@ -866,8 +968,7 @@ def run_gold_cycle(shared_store=None):
 
         closed_ts_str = df_5m["ts"].iloc[-1].strftime("%H:%M IST")
         ema50 = float(df_15m["ema50"].iloc[-1])
-        slope = float(df_15m["ema50_slope"].iloc[-1])
-        trend_label = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING/CHOP")
+        trend_label = "BULLISH" if ltp > ema50 else "BEARISH"
         nearest_str = f"{zones[0]['id']}: ${zones[0]['pivot']:.2f}" if zones else "None"
 
         log.info(f"[GOLD] ═════════ 5M EXECUTION AUDIT: {closed_ts_str} ═════════")
@@ -876,18 +977,19 @@ def run_gold_cycle(shared_store=None):
 
         sw_h, sw_l = find_swings(df_5m, w=3)
 
-        # Evaluate Top 6 Setups on 5M Timeframe
+        # Evaluate Top 7 Pure Price Action Setups (Pullback Retest checks FIRST!)
         setup = (
-            check_5m_volume_expansion(df_5m, df_15m)
-            or check_s3_breakout_liq_hunt(df_5m)
-            or check_london_asian_sweep(df_5m)
-            or check_user_3swing_inducement(df_5m, sw_h, sw_l)
-            or check_s3_breakout_opt(df_5m)
+            check_trend_pullback(df_5m, df_15m, state)
+            or check_5m_volume_expansion(df_5m, df_15m, state)
+            or check_pdh_pdl_breakout(df_5m, df_15m, state)
             or check_s2_pdh_pdl_sweep(df_5m, state)
+            or check_session_range_sweep(df_5m)
+            or check_user_3swing_inducement(df_5m, sw_h, sw_l)
+            or check_s3_breakout_opt(df_5m, df_15m)
         )
 
         if not setup:
-            log.info("[GOLD] Setups Evaluated: Vol_Blast=NO | S3_Liq=NO | London_Asian=NO | 3Swing_Trap=NO | S3_Opt=NO | S2=NO -> WAITING")
+            log.info("[GOLD] Setups Evaluated: PB_Retest=NO | Vol_Blast=NO | PDH_BO=NO | S2_Sweep=NO | Sess_Sweep=NO | 3Swing_Trap=NO | S3_Opt=NO -> WAITING")
             return
 
         passed, filter_msg = run_deterministic_filters(df_5m, setup)
@@ -914,7 +1016,7 @@ def run_gold_cycle(shared_store=None):
             f"Detected Setup: {setup['name']} ({setup['tier']})\n"
             f"Action: {setup['action']} | Entry: ${setup['entry']:.2f} | SL: ${setup['sl']:.2f} | TP: ${setup['tp']:.2f} ({setup['rr']} R:R)\n"
             f"Trigger Logic: {setup['why']}\n"
-            f"EMA50 Check: {setup['ema_note']} | ATR(14): ${df_5m['atr14'].iloc[-1]:.2f}"
+            f"EMA50 Check: {setup['ema_note']}"
         )
 
         ai_res, provider = call_ai_json(sys_p, usr_p)
@@ -925,9 +1027,8 @@ def run_gold_cycle(shared_store=None):
             state.set(cd_key, time.time() + WAIT_COOLDOWN_MIN * 60, ttl=WAIT_COOLDOWN_MIN * 60)
             return
 
+        # Cooldown applied (relaxed 35 min)
         state.set(cd_key, time.time() + (SIGNAL_COOLDOWN_MIN * 60), ttl=SIGNAL_COOLDOWN_MIN * 60)
-        if "s2_daily_key" in setup:
-            state.set(setup["s2_daily_key"], True, ttl=86400)
 
         em = "🟢" if "BUY" in setup["action"] else "🔴"
         action_title = "BUY (LONG)" if "BUY" in setup["action"] else "SELL (SHORT)"
@@ -952,8 +1053,8 @@ def run_gold_cycle(shared_store=None):
         tg_send(msg)
         log.info(f"[GOLD] 🔥 FIRED {setup['name']} ({setup['action']}) at ${setup['entry']:.2f} | AI: {ai_conf}")
 
-    except Exception:
-        log.exception("[GOLD] Error in run_gold_cycle")
+    except Exception as e:
+        log.exception(f"[GOLD] Error in run_gold_cycle: {type(e).__name__}")
     finally:
         try:
             _gold_lock.release()
@@ -967,6 +1068,7 @@ def run_6h_analysis(shared_store=None):
     Called by main.py at 05:32, 11:32, 17:32, 23:32 IST (UTC-aligned closes).
     """
     if not _gold_lock.acquire(blocking=False):
+        log.warning("[GOLD] 6H Macro analysis skipped: Execution lock busy")
         return
 
     try:
@@ -975,48 +1077,51 @@ def run_6h_analysis(shared_store=None):
 
         df_15m = fetch_delta_candles(GOLD_SYMBOL, "15m", hours_back=120, closed_only=True)
         if df_15m.empty or len(df_15m) < 35:
+            log.warning("[GOLD] 6H Macro skipped: Insufficient 15M candles from Delta")
             return
 
         df_15m = compute_indicators(df_15m)
         ltp = float(df_15m["c"].iloc[-1])
         ema50 = float(df_15m["ema50"].iloc[-1])
-        slope = float(df_15m["ema50_slope"].iloc[-1])
-        r_pct = float(df_15m["range_pct"].iloc[-1])
         r_high = float(df_15m["roll_h96"].iloc[-1])
         r_low = float(df_15m["roll_l96"].iloc[-1])
-        atr = float(df_15m["atr14"].iloc[-1])
-        pdh = float(df_15m["pdh"].iloc[-1]) if pd.notna(df_15m["pdh"].iloc[-1]) else 0.0
-        pdl = float(df_15m["pdl"].iloc[-1]) if pd.notna(df_15m["pdl"].iloc[-1]) else 0.0
 
         zones = build_gold_zones(state, df_15m, ltp)
-        trend_bias = "BULLISH" if ltp > ema50 and slope > 0 else ("BEARISH" if ltp < ema50 and slope < 0 else "RANGING / CONSOLIDATION")
+        trend_bias = "BULLISH" if ltp > ema50 else "BEARISH"
 
         log.info(f"[GOLD] ═════════ 6-HOUR MACRO RE-ANALYSIS ({now.strftime('%H:%M IST')}) ═════════")
-        log.info(f"[GOLD] LTP: ${ltp:.2f} | 50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | Trend: {trend_bias}")
+        log.info(f"[GOLD] LTP: ${ltp:.2f} | 50 EMA: ${ema50:.2f} | Trend: {trend_bias}")
         log.info(f"[GOLD] Active Zones ({len(zones)}): {', '.join([z['id'] for z in zones[:4]])}")
 
         sys_p = (
             "You are the Lead Institutional Gold (XAUUSD) Trading Supervisor. "
             "Provide a concise 1-2 sentence macro structure assessment for Gold. "
-            "Respond strictly in JSON: {\"macro_bias\": \"BULLISH/BEARISH/NEUTRAL\", \"assessment\": \"1-2 sentences\"}"
+            'Respond strictly in JSON: {"macro_bias": "BULLISH/BEARISH/NEUTRAL", "assessment": "1-2 sentences"}'
         )
         usr_p = (
             f"Asset: GOLD (XAUTUSD) | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Price: ${ltp:.2f}\n"
-            f"50 EMA: ${ema50:.2f} (Slope: {slope:+.2f}) | 48h Range: ${r_low:.2f} - ${r_high:.2f} (Pos: {r_pct:.1f}%)\n"
+            f"50 EMA: ${ema50:.2f} (Trend: {trend_bias}) | 24h Range: ${r_low:.2f} - ${r_high:.2f}\n"
             f"Key Zones: {', '.join([z['why'] for z in zones[:3]])}"
         )
 
         ai_res, provider = call_ai_json(sys_p, usr_p, max_tokens=300)
-        ai_text = (ai_res or {}).get("assessment", "Gold consolidating within key macro liquidity boundaries. Monitor London session sweeps.")
-        ai_bias = (ai_res or {}).get("macro_bias", trend_bias)
+        
+        # Honest AI Fallback
+        if not ai_res:
+            log.warning(f"[GOLD] ⚠️ 6H Macro AI failed ({provider}) — skipping Telegram broadcast to avoid misleading fallback.")
+            return
+
+        ai_text = ai_res.get("assessment", "Gold consolidating within key macro liquidity boundaries.")
+        ai_bias = ai_res.get("macro_bias", trend_bias)
+        state.set("macro_bias", ai_bias, ttl=21600)
 
         z_lines = [f"• <b>{esc(z['type'])}:</b> <code>${z['pivot']:,.2f}</code> ({esc(z['why'])})" for z in zones[:3]]
 
         msg = f"""🏛️ <b>[GOLD] 6-HOUR MACRO RE-ANALYSIS | {now.strftime('%H:%M IST')}</b>
 
 📊 <b>LTP     :</b> <b>${ltp:,.2f}</b> | <b>Trend:</b> <b>{trend_bias}</b>
-📐 <b>50 EMA :</b> <code>${ema50:,.2f}</code> (Slope: <code>{slope:+.2f}</code>)
-📏 <b>48h Rng :</b> <code>${r_low:,.1f} — ${r_high:,.1f}</code> (Pos: <code>{r_pct:.1f}%</code>)
+📐 <b>50 EMA :</b> <code>${ema50:.2f}</code>
+📏 <b>24h Rng :</b> <code>${r_low:,.1f} — ${r_high:,.1f}</code>
 
 🗺️ <b>Active 15M Macro Zones:</b>
 {chr(10).join(z_lines)}
@@ -1027,8 +1132,8 @@ def run_6h_analysis(shared_store=None):
         tg_send(msg)
         log.info(f"[GOLD] 🏛️ 6-Hour Macro Re-analysis published to Telegram.")
 
-    except Exception:
-        log.exception("[GOLD] Error in run_6h_analysis")
+    except Exception as e:
+        log.exception(f"[GOLD] Error in run_6h_analysis: {type(e).__name__}")
     finally:
         try:
             _gold_lock.release()
@@ -1044,7 +1149,7 @@ def run_gold_1m_tick(shared_store=None):
 
 
 if __name__ == "__main__":
-    log.info("[GOLD] Starting Gold Institutional Engine v8.5 on Koyeb...")
+    log.info("[GOLD] Starting Gold Institutional Engine v9.0 on Koyeb...")
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     state_init = GoldState()
@@ -1055,5 +1160,5 @@ if __name__ == "__main__":
         try:
             run_gold_cycle()
         except Exception as e:
-            log.error(f"[GOLD] Loop error: {e}")
+            log.error(f"[GOLD] Loop error: {type(e).__name__}")
         time.sleep(30)
