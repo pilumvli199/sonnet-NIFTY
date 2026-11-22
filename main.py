@@ -112,15 +112,23 @@ shared_store = SharedStateStore(REDIS_URL)
 
 
 def tg_broadcast(text: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+    target_chat = TG_CHAT_ID or nifty50.TG_CHAT_ID or gold.TG_CHAT_ID or bitcoin.TG_CHAT_ID
+    if not TG_BOT_TOKEN or not target_chat:
         log.info(f"[MAIN-TG-DRY]\n{text}\n")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": target_chat, "text": text, "parse_mode": "HTML"},
             timeout=12,
         )
+        if r.status_code != 200:
+            plain = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": target_chat, "text": plain},
+                timeout=12,
+            )
     except Exception as e:
         log.error(f"[MAIN] Telegram broadcast error: {type(e).__name__}")
 
