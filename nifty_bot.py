@@ -455,7 +455,7 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd
         if len(df_today) >= 8:
             sc5 = _median_range(df_today, 15)
             hh5, ll5, cc5 = df_today["h"].values, df_today["l"].values, df_today["c"].values
-            for k in range(3, len(df_today) - 2):
+            for k in range(3, len(df_today) - 3):
                 ft = _ensure_ist(df_today["ts"].iloc[k])
                 if hh5[k] == np.max(hh5[k - 3 : k + 3]) and (hh5[k] - np.min(ll5[k + 1 : k + 3])) >= 1.2 * sc5:
                     if len(hh5[k + 3 : -1]) == 0 or (np.max(hh5[k + 3 : -1]) <= hh5[k] and np.max(cc5[k + 3 : -1]) <= hh5[k]):
@@ -488,7 +488,8 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd
     for cand in raw_boxes:
         m = next((x for x in merged if x["type"] == cand["type"] and abs(float(x["pivot"]) - float(cand["pivot"])) <= SHELF_MERGE_PTS), None)
         if m:
-            m["touches"] = m.get("touches", 1) + 1
+            if not str(m.get("source", "")).startswith("AI_") and not str(cand.get("source", "")).startswith("AI_"):
+                m["touches"] = m.get("touches", 1) + 1
             m["age_days"] = max(m.get("age_days", 0), cand.get("age_days", 0))
             m["pivot"] = round(max(float(m["pivot"]), float(cand["pivot"])) if cand["type"] == "RESISTANCE" else min(float(m["pivot"]), float(cand["pivot"])), 2)
         else:
@@ -517,9 +518,17 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
     now = datetime.now(IST)
     low_b, high_b = round(ltp - DEEP_BAND_PTS, 1), round(ltp + DEEP_BAND_PTS, 1)
 
-    # Fetch 3-year 1D & 1W historical candles
+    # Fetch 3-year 1D historical candles & derive 1W cleanly via pandas resample
     df_1d_3y = fetch_upstox_candles("days", 1, days_back=1095, include_intraday=False, closed_only=True)
-    df_1w_3y = fetch_upstox_candles("weeks", 1, days_back=1095, include_intraday=False, closed_only=True)
+    df_1w_3y = pd.DataFrame()
+    if df_1d_3y is not None and not df_1d_3y.empty:
+        df_1w_3y = (
+            df_1d_3y.set_index("ts")
+            .resample("1W")
+            .agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"})
+            .dropna()
+            .reset_index()
+        )
 
     hist_hits = []
     for df_h, lbl in [(df_1w_3y, "1W"), (df_1d_3y, "1D")]:
@@ -563,7 +572,7 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_PTS:
                 continue
-            zid = f"AI_BAND_{ztype[:3]}_{int(piv)}_{now.strftime('%H%M')}_{idx}"
+            zid = f"AI_BAND_{ztype[:3]}_{int(piv)}_{now.strftime('%Y%m%d')}"
             item = {
                 "id": zid, "type": ztype, "tf": str(z.get("tf", "HIST_1D")), "prio": 2,
                 "pivot": piv, "age_days": 30, "touches": 1,
@@ -576,6 +585,8 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
 
     if added:
         state.set("ai_zones", existing_ai[-30:], ttl=86400)
+        cur_active = state.get("active_zones") or []
+        state.set("active_zones", (added + cur_active)[:25], ttl=86400)
         lines = [f"• <b>{z['type']}</b> @ <code>{z['pivot']}</code> ({esc(z['why'])})" for z in added[:5]]
         tg_send(
             f"🧭 <b>[NIFTY 50 DEEP BAND SYNC | {esc(provider)}]</b>\n"
@@ -692,7 +703,7 @@ def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: s
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_PTS:
                 continue
-            zid = f"AI_TD_{ztype[:3]}_{int(piv)}_{now.strftime('%Y%m%d_%H')}_{idx}"
+            zid = f"AI_TD_{ztype[:3]}_{int(piv)}_{now.strftime('%Y%m%d')}"
             ai_saved.append({
                 "id": zid, "type": ztype, "tf": str(z.get("tf", "CURR_DAY")), "prio": 2,
                 "pivot": piv, "age_days": 0, "touches": 1,
@@ -989,10 +1000,14 @@ def run_nifty_cycle(shared_store=None):
         df_1h = fetch_upstox_candles("hours", 1, days_back=15, include_intraday=True, closed_only=True)
 
         regime = state.get("regime") or get_pure_pa_regime(df_1h)
-        zones = state.get("active_zones")
-        if zones is None:
-            zones = extract_pure_blue_boxes(None, df_1h, df_15m, df_5m, ltp, close_ts, state)
-            state.set("active_zones", zones, ttl=14400)
+        cached_htf = state.get("active_zones") or []
+        live_zones = extract_pure_blue_boxes(None, df_1h, df_15m, df_5m, ltp, close_ts, state)
+        # Merge cached 1D/AI zones with freshly updated 1H/15M/Current-Day dynamic zones
+        zones = list(live_zones)
+        for cz in cached_htf:
+            if not state.is_spent(cz["id"]) and not any(x["type"] == cz["type"] and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_PTS for x in zones):
+                zones.append(cz)
+        state.set("active_zones", zones[:25], ttl=21600)
 
         # 3. Check Zone Vacuum (< 2 zones in LTP ± 300 pts) -> Dynamic 3-Yr Band Slice / New High Fallback
         check_zone_vacuum_and_trigger_band(state, zones, ltp, df_5m)
