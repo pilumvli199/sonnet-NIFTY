@@ -1,1261 +1,974 @@
 """
-╔══════════════════════════════════════════════════════════════════════════╗
-║   BITCOIN (BTCUSD) INSTITUTIONAL LIQUIDITY ENGINE — V9.5                 ║
-║   Namespace: BTC:*  |  Delta Exchange Public API (5M Sniper Execution)   ║
-║                                                                          ║
-║   100% PURE FORMAL LIQUIDITY ARCHITECTURE (ENTRY-ONLY IDENTIFICATION):   ║
-║   1. BIG_SR_SWEEP [1W, 1D, 4H, 1H] (First-Touch Un-swept Pool Sweep)     ║
-║      - 1W (PWH/PWL + Swings), 1D (PDH/PDL + Swings), 4H, 1H (With-Trend) ║
-║   2. TUNED_3SWING_INDUCEMENT_TRAP (w=4 Fractal + Trend/Big S/R + <=$160) ║
-║   3. FRESH_30M_EQH_EQL_HUNT (Fresh <=30m Equal Highs/Lows Sweep)         ║
-║                                                                          ║
-║   REMOVED NOISE SETUPS:                                                  ║
-║   • S3_BREAKOUT_OPT, 5M_VOLUME_EXPANSION_BLAST, PDH_PDL_BREAKOUT,        ║
-║     TREND_PULLBACK_RETEST, IST-Midnight SESSION_RANGE_SWEEP              ║
-║                                                                          ║
-║   DUAL-TIER AI + NON-BLOCKING HYDROGEN CONFIRMATION:                     ║
-║   • Tier-1 (Heavy Macro & Post-Entry Confirmation):                      ║
-║     gemini-4-hydrogen (HIGH) -> gemini-3.8-flash (HIGH) ->               ║
-║     gemini-3.6-flash (OFF) -> gemini-3.5-flash-lite (HIGH) -> Claude     ║
-║   • Tier-2 (5M Live Entry Gatekeeper — Zero Latency):                    ║
-║     gemini-3.5-flash-lite (OFF) -> gemini-3.1-flash-lite (OFF) -> Claude ║
-║   • Generous Timeouts (No premature cutoff; fallback only on true fail)  ║
-║   • 23:30 IST Dedicated Macro Thread (2-Min Auto-Retry for Hydrogen)     ║
-║   • 3x Intraday Sync (05:30, 11:30, 17:30 IST) + Shared Duplicate Lock   ║
-║   • Spent Zone Lock + 60-Min Opposite-Direction Lock + Manual SL/TP Ref  ║
-╚══════════════════════════════════════════════════════════════════════════╝
+================================================================================
+GOLD (XAUTUSD) PURE LIQUIDITY ENGINE — PRODUCTION V10.0
+Namespace: GOLD:* | Delta Exchange India Public API | 100% Price Action
+================================================================================
+ARCHITECTURE:
+  • Schedule (IST):
+    - 23:30 IST: Daily BIG Multi-TF Analysis (1D + 4H + 1H + 15M + 5M)
+    - 05:30, 11:30, 17:30 IST: Every 6-Hour Intraday Zone Sync (Current-Day Zones)
+    - Every 5M Candle Close (:05s): Zero-Lag Python Liquidity Hunt Scanner
+  • Dynamic Historical Price-Band Slice (Zone Vacuum Protection):
+    - Triggers if < 2 untouched zones exist within LTP ± $100.
+    - Fetches 3-Year 1D + 11-Month 4H history, filters ONLY candles inside
+      LTP ± $200 + Today's intraday candles (60m band cooldown).
+    - On New All-Time High (0 historical candles in band), runs seamlessly on
+      Current-Day Data + Real-Time Dynamic Swing Zones.
+  • Pure Liquidity Setups (Entry-Only Mode — Manual SL & Target):
+    1. OLD_HTF_BLUE_BOX (1D / 4H / 1H untouched up to 85d + AI-marked zones)
+    2. MULTI_TOUCH_SHELF (2+ untouched swings within $2.50)
+    3. EXHAUSTION_TRAP_PT10 (3+ same-color candles / big bar into Blue Box)
+    4. TREND_PULLBACK_LIQ_HUNT (15M clean impulse pullback sweep — +32.5R proven)
+    5. BREAKOUT_FLIP_HUNT (Broken 1D/4H/1H Blue Box retest with trend)
+    6. DUAL_SIDE_HUNT_PT7 (Consolidation sweeps Side A first, then Side B)
+    7. CURRENT_DAY_DYNAMIC_ZONE (Real-time swing Blue Box formed today)
+  • AI Model Chain (No 3.8/3.6):
+    - Heavy / 6H Sync: gemini-4-hydrogen (HIGH) -> gemini-3.5-flash-lite (HIGH) -> gemini-3.1-flash-lite (OFF)
+    - Live Confirm     : gemini-3.5-flash-lite (HIGH) -> gemini-3.1-flash-lite (OFF)
+================================================================================
 """
 
 import os
 import json
+import math
 import time
 import html
 import logging
 import threading
+from datetime import datetime, timedelta
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime
 import pytz
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 IST = pytz.timezone("Asia/Kolkata")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("BTC")
+log = logging.getLogger("GOLD")
 
 # ==============================================================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==============================================================================
 GEMINI_API_KEYS     = [k.strip() for k in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",") if k.strip() and "your_" not in k.lower()]
-ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "").strip()
-if "your_" in ANTHROPIC_KEY.lower():
-    ANTHROPIC_KEY = ""
-
 TG_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID          = os.getenv("BTC_TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+TG_CHAT_ID          = os.getenv("GOLD_TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 
-DELTA_BASE_URL      = os.getenv("DELTA_BASE_URL", "https://api.india.delta.exchange")
+DELTA_BASE_URL      = os.getenv("DELTA_BASE_URL", "https://api.india.delta.exchange").strip()
 DELTA_API_KEY       = os.getenv("DELTA_API_KEY", "").strip()
 if "your_" in DELTA_API_KEY.lower():
     DELTA_API_KEY = ""
-DELTA_API_SECRET    = os.getenv("DELTA_API_SECRET", "").strip()
+GOLD_SYMBOL         = os.getenv("GOLD_SYMBOL", "XAUTUSD").strip()
 
-BTC_SYMBOL          = os.getenv("BTC_SYMBOL", "BTCUSD")
-PORT                = int(os.getenv("PORT", "8080"))
-
-# Cooldowns & Locks
-WAIT_COOLDOWN_MIN   = int(os.getenv("BTC_WAIT_COOLDOWN_MIN", "15"))
-SETUP_COOLDOWN_MIN  = int(os.getenv("BTC_SETUP_COOLDOWN_MIN", "90"))
-OPPOSITE_LOCK_MIN   = int(os.getenv("BTC_OPPOSITE_LOCK_MIN", "60"))
-
-# AI Models (Configurable via Env Vars with Benchmark-Validated Defaults)
+# AI Models
 HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-hydrogen").strip()
-FLASH_38_MODEL      = os.getenv("GEMINI_38_MODEL", "gemini-3.8-flash").strip()
-FLASH_36_MODEL      = os.getenv("GEMINI_36_MODEL", "gemini-3.6-flash").strip()
 LITE_35_MODEL       = os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite").strip()
 LITE_31_MODEL       = os.getenv("GEMINI_31_LITE_MODEL", "gemini-3.1-flash-lite").strip()
-CLAUDE_BACKUP_MODEL = os.getenv("CLAUDE_BACKUP_MODEL", "claude-haiku-5-5").strip()
 
-# Tier-1 Heavy Chain: (model_name, thinking_level, generous_timeout_sec)
 HEAVY_AI_CHAIN = [
-    (HYDROGEN_MODEL, "HIGH", 300),
-    (FLASH_38_MODEL, "HIGH", 300),
-    (FLASH_36_MODEL, "OFF",  240),
-    (LITE_35_MODEL,  "HIGH", 90),
+    (HYDROGEN_MODEL, "HIGH", 240, 4096),
+    (LITE_35_MODEL,  "HIGH",  90, 4096),
+    (LITE_31_MODEL,  "OFF",   45, 2048),
 ]
 
-# Tier-2 Fast 5M Gatekeeper Chain: (model_name, thinking_level, timeout_sec)
-FAST_5M_AI_CHAIN = [
-    (LITE_35_MODEL, "OFF", 35),
-    (LITE_31_MODEL, "OFF", 35),
+LIVE_CONFIRM_CHAIN = [
+    (LITE_35_MODEL,  "HIGH",  45, 2048),
+    (LITE_31_MODEL,  "OFF",   30, 2048),
 ]
 
-_btc_lock = threading.Lock()
+# Pure Liquidity Constants (Gold USD)
+CANDLE_BUFFER_SEC   = 2
+ZONE_BUFFER_USD     = 1.80
+SHELF_MERGE_USD     = 2.50
+FLIP_BREAK_USD      = 2.50
+MAX_ZONE_AGE_DAYS   = 85
+VACUUM_RADIUS_USD   = 100.0   # User-specified: trigger deep band if < 2 zones in LTP ± $100
+DEEP_BAND_USD       = 200.0   # Wide rally/crash historical slice: LTP ± $200
+SETUP_COOLDOWN_MIN  = int(os.getenv("GOLD_SETUP_COOLDOWN_MIN", "60"))
+OPPOSITE_LOCK_MIN   = int(os.getenv("GOLD_OPPOSITE_LOCK_MIN", "45"))
+
+_gold_lock = threading.Lock()
 _ai_rate_lock = threading.Lock()
 _gemini_idx = 0
 _last_gemini_call = 0.0
-_daily_ai_call_count = 0
+_daily_ai_calls = 0
 _daily_ai_date = None
-_last_daily_report_date = None
 
 
-def esc(text):
-    return html.escape(str(text), quote=False) if text is not None else ""
+def esc(val) -> str:
+    return html.escape(str(val), quote=False) if val is not None else ""
 
 
 # ==============================================================================
-# IN-MEMORY / SHARED STATE STORE (WITH REDIS COMPATIBILITY)
+# NAMESPACE STATE STORE (GOLD:*)
 # ==============================================================================
-class DefaultStore:
+class _LocalStore:
     def __init__(self):
-        self._data = {}
-        self._exp = {}
-        self._lock = threading.Lock()
+        self._d = {}
+        self._e = {}
+        self._lk = threading.Lock()
 
-    def set(self, key, value, ttl=86400):
-        with self._lock:
-            self._data[key] = value
-            self._exp[key] = time.time() + ttl
+    def set(self, k, v, ttl=86400):
+        with self._lk:
+            self._d[k] = v
+            self._e[k] = time.time() + ttl
 
-    def get(self, key):
-        with self._lock:
-            if key in self._exp and time.time() > self._exp[key]:
-                self._data.pop(key, None)
-                self._exp.pop(key, None)
+    def get(self, k):
+        with self._lk:
+            if k in self._e and time.time() > self._e[k]:
+                self._d.pop(k, None)
+                self._e.pop(k, None)
                 return None
-            return self._data.get(key)
+            return self._d.get(k)
 
 
-_global_store = DefaultStore()
+_fallback_store = _LocalStore()
 
 
-class BtcState:
-    PREFIX = "BTC:"
+class GoldState:
+    PREFIX = "GOLD:"
 
     def __init__(self, shared_store=None):
-        self.store = shared_store if shared_store is not None else _global_store
+        self.store = shared_store if shared_store is not None else _fallback_store
 
-    def set(self, key, value, ttl=86400):
+    def set(self, key: str, value, ttl: int = 86400):
         self.store.set(f"{self.PREFIX}{key}", value, ttl=ttl)
 
-    def get(self, key):
+    def get(self, key: str):
         return self.store.get(f"{self.PREFIX}{key}")
 
-    def mark_spent(self, bucket: str, item_id: str, ttl=172800):
-        spent = self.get(bucket) or []
-        if item_id not in spent:
-            spent.append(item_id)
-            if len(spent) > 300:
-                spent = spent[-300:]
-            self.set(bucket, spent, ttl=ttl)
+    def mark_spent(self, zone_id: str, ttl: int = 172800):
+        spent = self.get("spent_zones") or []
+        if zone_id not in spent:
+            spent.append(zone_id)
+            if len(spent) > 400:
+                spent = spent[-400:]
+            self.set("spent_zones", spent, ttl=ttl)
 
-    def is_spent(self, bucket: str, item_id: str) -> bool:
-        spent = self.get(bucket) or []
-        return item_id in spent
+    def is_spent(self, zone_id: str) -> bool:
+        return zone_id in (self.get("spent_zones") or [])
 
 
 # ==============================================================================
-# KOYEB HTTP HEALTH CHECK SERVER (FOR UPTIMEROBOT 24/7 PING)
+# TELEGRAM HELPER
 # ==============================================================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK - BTC Institutional Liquidity Engine v9.5 Active\n")
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server():
+def tg_send(text: str) -> bool:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log.info(f"[GOLD-TG-DRY]\n{text}\n")
+        return False
     try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-        log.info(f"[BTC] Health Check HTTP server listening on port {PORT} for UptimeRobot")
-        server.serve_forever()
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            plain = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
+            r2 = requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TG_CHAT_ID, "text": plain},
+                timeout=12,
+            )
+            return r2.status_code == 200
+        return True
     except Exception as e:
-        log.error(f"[BTC] HTTP health server error: {type(e).__name__}")
+        log.error(f"[GOLD] Telegram send error: {type(e).__name__}")
+        return False
 
 
 # ==============================================================================
-# DUAL-TIER AI ENGINE (GENEROUS TIMEOUTS + THINKING CONTROL + CLAUDE BACKUP)
+# GEMINI AI ENGINE (NO thinkingBudget:0 BUG + thought PART FILTERING)
 # ==============================================================================
 def _bump_ai_counter():
-    global _daily_ai_call_count, _daily_ai_date
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    if _daily_ai_date != today_str:
-        _daily_ai_date = today_str
-        _daily_ai_call_count = 0
-    _daily_ai_call_count += 1
+    global _daily_ai_calls, _daily_ai_date
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    if _daily_ai_date != today:
+        _daily_ai_date = today
+        _daily_ai_calls = 0
+    _daily_ai_calls += 1
 
 
-def _parse_json_response(raw_text: str):
-    if not raw_text:
+def _parse_json_safe(raw: str):
+    if not raw:
         return None
-    clean = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    clean = raw.strip().replace("```json", "").replace("```", "").strip()
     s, e = clean.find("{"), clean.rfind("}") + 1
     if s != -1 and e > s:
-        return json.loads(clean[s:e])
+        try:
+            return json.loads(clean[s:e])
+        except Exception:
+            return None
     return None
 
 
-def _call_single_gemini_model(model_name: str, thinking_level: str, timeout_sec: int, system_prompt: str, user_prompt: str, max_tokens: int):
+def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max_tokens: int, sys_prompt: str, user_prompt: str):
     global _gemini_idx, _last_gemini_call
     if not GEMINI_API_KEYS:
         return None
 
     for _ in range(len(GEMINI_API_KEYS)):
         with _ai_rate_lock:
-            now = time.time()
-            elapsed = now - _last_gemini_call
-            if elapsed < 4.2:
-                time.sleep(4.2 - elapsed)
+            wait = 4.1 - (time.time() - _last_gemini_call)
+            if wait > 0:
+                time.sleep(wait)
             _last_gemini_call = time.time()
-            api_key = GEMINI_API_KEYS[_gemini_idx % len(GEMINI_API_KEYS)]
+            key = GEMINI_API_KEYS[_gemini_idx % len(GEMINI_API_KEYS)]
             _gemini_idx += 1
             _bump_ai_counter()
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
         gen_cfg = {
             "temperature": 0.0,
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
         }
-        if thinking_level:
-            gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level}
+        if thinking_lvl and thinking_lvl.upper() != "OFF":
+            if "4-hydrogen" in model_name:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_lvl.upper()}
+            else:
+                b_map = {"LOW": 2048, "MEDIUM": 4096, "HIGH": 8192}
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": b_map.get(thinking_lvl.upper(), 4096)}
 
         payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "systemInstruction": {"parts": [{"text": sys_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": gen_cfg,
         }
 
         try:
             r = requests.post(url, json=payload, timeout=timeout_sec)
-
-            # Schema fallback: if a model variant rejects thinkingConfig with HTTP 400, retry once without thinkingConfig
             if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in gen_cfg:
                 gen_cfg.pop("thinkingConfig", None)
                 r = requests.post(url, json=payload, timeout=timeout_sec)
 
             if r.status_code == 429:
-                log.warning(f"[BTC] {model_name} HTTP 429 rate limit — switching key/model...")
+                log.warning(f"[GOLD] {model_name} HTTP 429 — rotating key...")
                 continue
             if r.status_code in (500, 502, 503, 504):
-                log.warning(f"[BTC] {model_name} HTTP {r.status_code} server busy — falling back to next model...")
+                log.warning(f"[GOLD] {model_name} HTTP {r.status_code} — falling back...")
                 break
             if r.status_code == 200:
-                candidates = r.json().get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    # Skip thought parts if returned separately and pick text output
+                cands = r.json().get("candidates", [])
+                if cands:
+                    parts = cands[0].get("content", {}).get("parts", [])
                     text_parts = [p.get("text", "") for p in parts if not p.get("thought", False) and p.get("text")]
-                    raw = "\n".join(text_parts) if text_parts else (parts[0].get("text", "") if parts else "")
-                    parsed = _parse_json_response(raw)
+                    raw = "\n".join(text_parts) if text_parts else ""
+                    parsed = _parse_json_safe(raw)
                     if parsed is not None:
                         return parsed
             else:
-                log.warning(f"[BTC] {model_name} returned HTTP {r.status_code}")
+                log.warning(f"[GOLD] {model_name} HTTP {r.status_code}")
                 break
         except requests.Timeout:
-            log.warning(f"[BTC] {model_name} timed out after {timeout_sec}s — falling back...")
+            log.warning(f"[GOLD] {model_name} timeout ({timeout_sec}s) — falling back...")
             break
         except Exception as e:
-            log.warning(f"[BTC] {model_name} error ({type(e).__name__}) — falling back...")
+            log.warning(f"[GOLD] {model_name} error ({type(e).__name__}) — falling back...")
             break
-
     return None
 
 
-def _call_claude_backup(system_prompt: str, user_prompt: str, max_tokens: int):
-    if not ANTHROPIC_KEY:
-        return None, None
-    models_to_try = [CLAUDE_BACKUP_MODEL]
-    if CLAUDE_BACKUP_MODEL != "claude-haiku-4-5-20251001":
-        models_to_try.append("claude-haiku-4-5-20251001")
-
-    for c_model in models_to_try:
-        hdrs = {
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        body = {
-            "model": c_model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        try:
-            _bump_ai_counter()
-            r = requests.post("https://api.anthropic.com/v1/messages", headers=hdrs, json=body, timeout=60)
-            if r.status_code == 200:
-                raw = r.json()["content"][0]["text"]
-                parsed = _parse_json_response(raw)
-                if parsed is not None:
-                    return parsed, f"CLAUDE ({c_model})"
-        except Exception as e:
-            log.warning(f"[BTC] Claude backup ({c_model}) error: {type(e).__name__}")
-    return None, None
-
-
-def call_ai_chain(chain: list, system_prompt: str, user_prompt: str, max_tokens: int = 750):
-    """Executes the ordered AI model chain with configured thinking levels and Claude failover."""
-    for model_name, thinking_lvl, timeout_sec in chain:
-        res = _call_single_gemini_model(model_name, thinking_lvl, timeout_sec, system_prompt, user_prompt, max_tokens)
+def call_gemini_chain(chain: list, sys_prompt: str, user_prompt: str):
+    for model_name, t_lvl, t_sec, m_tok in chain:
+        res = call_gemini_single(model_name, t_lvl, t_sec, m_tok, sys_prompt, user_prompt)
         if res is not None:
-            tag = f"{model_name} [{thinking_lvl}]"
-            return res, tag
-
-    claude_res, claude_tag = _call_claude_backup(system_prompt, user_prompt, max_tokens)
-    if claude_res is not None:
-        return claude_res, claude_tag
-
-    return None, "ALL_MODELS_UNREACHABLE"
+            return res, f"{model_name} [{t_lvl}]"
+    return None, "AI_UNREACHABLE"
 
 
 # ==============================================================================
-# DELTA EXCHANGE CANDLES FETCHER (WITH UNCLOSED CANDLE GUARD FOR ALL TFs)
+# DELTA EXCHANGE CANDLES FETCHER + CLOSED-CANDLE BUFFER GUARD
 # ==============================================================================
-def fetch_delta_candles(symbol: str, resolution: str, hours_back: int, closed_only: bool = True):
+def _ensure_ist(ts_val) -> datetime:
+    dt = pd.Timestamp(ts_val).to_pydatetime()
+    return IST.localize(dt) if dt.tzinfo is None else dt.astimezone(IST)
+
+
+def fetch_delta_candles(resolution: str, hours_back: int, closed_only: bool = True) -> pd.DataFrame:
     end_ts = int(time.time())
     start_ts = end_ts - (hours_back * 3600)
-    url = f"{DELTA_BASE_URL}/v2/history/candles"
-    params = {"symbol": symbol, "resolution": resolution, "start": start_ts, "end": end_ts}
-    res_sec = {
-        "1m": 60,
-        "3m": 180,
-        "5m": 300,
-        "15m": 900,
-        "30m": 1800,
-        "1h": 3600,
-        "2h": 7200,
-        "4h": 14400,
-        "6h": 21600,
-        "1d": 86400,
-        "1w": 604800,
-    }.get(resolution, 300)
-
-    headers = {}
-    if DELTA_API_KEY:
-        headers["api-key"] = DELTA_API_KEY
+    res_sec = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}.get(resolution, 300)
+    headers = {"api-key": DELTA_API_KEY} if DELTA_API_KEY else {}
 
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
+        r = requests.get(
+            f"{DELTA_BASE_URL}/v2/history/candles",
+            params={"symbol": GOLD_SYMBOL, "resolution": resolution, "start": start_ts, "end": end_ts},
+            headers=headers,
+            timeout=18,
+        )
         if r.status_code == 200:
-            res = r.json().get("result", [])
-            if not res:
+            rows = r.json().get("result", [])
+            if not rows:
                 return pd.DataFrame()
-            df = pd.DataFrame(res)
+            df = pd.DataFrame(rows)
             df["time"] = df["time"].astype(int)
-            df["ts_utc"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df["ts"] = df["ts_utc"].dt.tz_convert(IST)
+            df["ts"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(IST)
             df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
-            df[["o", "h", "l", "c"]] = df[["o", "h", "l", "c"]].astype(float).round(1)
+            for col in ["o", "h", "l", "c"]:
+                df[col] = df[col].astype(float).round(2)
             df["v"] = df["v"].astype(float)
             df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
 
             if closed_only and not df.empty:
-                last_open_ts = int(df.iloc[-1]["time"])
-                if end_ts < (last_open_ts + res_sec):
+                last_open = int(df.iloc[-1]["time"])
+                if end_ts < (last_open + res_sec + CANDLE_BUFFER_SEC):
                     df = df.iloc[:-1].reset_index(drop=True)
-            return df
+            return df[["time", "ts", "o", "h", "l", "c", "v"]]
     except Exception as e:
-        log.error(f"[BTC] Delta candle fetch error ({resolution}): {type(e).__name__}")
+        log.error(f"[GOLD] Delta fetch error ({resolution}): {type(e).__name__}")
     return pd.DataFrame()
 
 
-def tg_send(text: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.info(f"[BTC-TG-DRY]\n{text}\n")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            log.warning(f"[BTC] Telegram HTTP {r.status_code}")
-            return False
-        return True
-    except Exception as e:
-        log.error(f"[BTC] Telegram error: {type(e).__name__}")
-        return False
+def encode_delta_candles(df: pd.DataFrame, limit: int, base_price: float, fmt: str = "%m-%d %H:%M") -> list:
+    if df is None or df.empty:
+        return []
+    sub = df.tail(limit)
+    out = []
+    for _, r in sub.iterrows():
+        t_s = _ensure_ist(r["ts"]).strftime(fmt)
+        o = round(float(r["o"]) - base_price, 2)
+        h = round(float(r["h"]) - base_price, 2)
+        l = round(float(r["l"]) - base_price, 2)
+        c = round(float(r["c"]) - base_price, 2)
+        out.append(f"{t_s}: O{o:+.2f} H{h:+.2f} L{l:+.2f} C{c:+.2f}")
+    return out
 
 
 # ==============================================================================
-# MULTI-TF FORMAL LIQUIDITY POOL & EQH/EQL ENGINE (1W, 1D, 4H, 1H)
+# PURE PRICE-ACTION REGIME & PERSISTENT BLUE BOX ENGINE (ZERO INDICATORS)
 # ==============================================================================
-def compute_indicators(df: pd.DataFrame):
-    df_new = df.copy()
-    df_new["ema20"] = df_new["c"].ewm(span=20, adjust=False).mean()
-    df_new["ema50"] = df_new["c"].ewm(span=50, adjust=False).mean()
-    return df_new
+def _median_range(df: pd.DataFrame, n: int = 20) -> float:
+    if df is None or df.empty:
+        return 3.0
+    v = float((df["h"] - df["l"]).tail(n).median())
+    return v if v > 0 else 3.0
 
 
-def _extract_tf_pools(df_tf: pd.DataFrame, tf_name: str, w: int, eq_tol: float, max_bars_back: int):
-    pools = []
-    if df_tf.empty or len(df_tf) < (2 * w + 3):
-        return pools
+def get_pure_pa_regime(df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> str:
+    def _eval(hd):
+        if hd is None or len(hd) < 10:
+            return "SIDEWAYS"
+        sub = hd.tail(10)
+        hh, ll, cc = sub["h"].values, sub["l"].values, sub["c"].values
+        sc = float(np.median(hh - ll))
+        if (np.max(hh[5:]) > np.max(hh[:5]) and np.min(ll[5:]) > np.min(ll[:5])) or (cc[-1] - cc[4]) > 1.7 * sc:
+            return "TRENDING_BULL"
+        if (np.max(hh[5:]) < np.max(hh[:5]) and np.min(ll[5:]) < np.min(ll[:5])) or (cc[-1] - cc[4]) < -1.7 * sc:
+            return "TRENDING_BEAR"
+        return "SIDEWAYS"
 
-    sub = df_tf.tail(max_bars_back).reset_index(drop=True)
-    hh = sub["h"].values
-    ll = sub["l"].values
-    tt = sub["time"].values
-    m = len(sub)
-
-    recent_highs = []
-    recent_lows = []
-
-    for idx in range(w, m - w):
-        bar_t = int(tt[idx])
-        # Confirmed Fractal Swing High (Buy-Side Liquidity - BSL)
-        if hh[idx] >= np.max(hh[idx - w:idx]) and hh[idx] >= np.max(hh[idx + 1:idx + w + 1]):
-            lvl = float(hh[idx])
-            # Ensure no subsequent closed bar in this TF already swept/broke it
-            if np.max(hh[idx + 1:]) <= lvl:
-                is_eq = any(abs(lvl - p["pivot"]) <= eq_tol for p in recent_highs[-10:])
-                pool = {
-                    "id": f"{tf_name}_BSL_{int(lvl)}_{bar_t}",
-                    "tf": tf_name,
-                    "side": "BSL",  # Above price -> Sweep triggers SELL (SHORT)
-                    "pivot": lvl,
-                    "is_eq": is_eq,
-                    "why": f"{tf_name} {'EQH' if is_eq else 'Swing High'} BSL (${lvl:,.1f})",
-                }
-                pools.append(pool)
-                recent_highs.append(pool)
-
-        # Confirmed Fractal Swing Low (Sell-Side Liquidity - SSL)
-        if ll[idx] <= np.min(ll[idx - w:idx]) and ll[idx] <= np.min(ll[idx + 1:idx + w + 1]):
-            lvl = float(ll[idx])
-            if np.min(ll[idx + 1:]) >= lvl:
-                is_eq = any(abs(lvl - p["pivot"]) <= eq_tol for p in recent_lows[-10:])
-                pool = {
-                    "id": f"{tf_name}_SSL_{int(lvl)}_{bar_t}",
-                    "tf": tf_name,
-                    "side": "SSL",  # Below price -> Sweep triggers BUY (LONG)
-                    "pivot": lvl,
-                    "is_eq": is_eq,
-                    "why": f"{tf_name} {'EQL' if is_eq else 'Swing Low'} SSL (${lvl:,.1f})",
-                }
-                pools.append(pool)
-                recent_lows.append(pool)
-
-    return pools
+    r4 = _eval(df_4h)
+    r1 = _eval(df_1h)
+    if r4 == "TRENDING_BULL" or (r4 == "SIDEWAYS" and r1 == "TRENDING_BULL"):
+        return "TRENDING_BULL"
+    if r4 == "TRENDING_BEAR" or (r4 == "SIDEWAYS" and r1 == "TRENDING_BEAR"):
+        return "TRENDING_BEAR"
+    return "SIDEWAYS"
 
 
-def sync_htf_liquidity_pools(state: BtcState, include_1d_1w: bool = True):
-    """
-    Syncs formal un-swept liquidity pools across 1W, 1D (180d), 4H (30d), and 1H (7d),
-    calculates 6H/4H trend alignment, and counts EQH (BSL) vs EQL (SSL) pools.
-    """
-    df_1h = fetch_delta_candles(BTC_SYMBOL, "1h", hours_back=240, closed_only=True)
-    df_4h = fetch_delta_candles(BTC_SYMBOL, "4h", hours_back=720, closed_only=True)
-
-    if df_1h.empty or df_4h.empty:
-        log.warning("[BTC] HTF sync skipped: 1H or 4H candles empty")
-        return None
-
-    df_1h = compute_indicators(df_1h)
-    df_4h = compute_indicators(df_4h)
-
-    # Build 6H closed structure from 1H closed bars (aligned to 00:00, 06:00, 12:00, 18:00 UTC)
-    df_6h = (
-        df_1h.set_index("ts_utc")
-        .resample("6h")
-        .agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"})
-        .dropna()
-        .reset_index()
-    )
-    df_6h["ema20"] = df_6h["c"].ewm(span=20, adjust=False).mean()
-
-    ltp = float(df_1h["c"].iloc[-1])
-    ema20_6h = float(df_6h["ema20"].iloc[-1]) if not df_6h.empty else ltp
-    ema50_4h = float(df_4h["ema50"].iloc[-1])
-    t6 = "BULLISH" if ltp > ema20_6h else "BEARISH"
-    t4 = "BULLISH" if ltp > ema50_4h else "BEARISH"
-
-    if t6 == "BULLISH" and t4 == "BULLISH":
-        struct_bias = "BULLISH"
-    elif t6 == "BEARISH" and t4 == "BEARISH":
-        struct_bias = "BEARISH"
-    else:
-        struct_bias = "RANGE"
-
-    # Extract 1H & 4H formal pools
-    pools_1h = _extract_tf_pools(df_1h, "1H", w=2, eq_tol=50.0, max_bars_back=72)
-    pools_4h = _extract_tf_pools(df_4h, "4H", w=2, eq_tol=90.0, max_bars_back=180)
-
-    # Preserve existing 1D/1W pools if intraday sync, or refresh full 180d 1D + 1W
-    existing_pools = state.get("htf_pools") or []
-    pools_1d_1w = [p for p in existing_pools if p.get("tf") in ("1D", "1W")]
-
-    pdh, pdl, pwh, pwl = 0.0, 0.0, 0.0, 0.0
-    if include_1d_1w or not pools_1d_1w:
-        df_1d = fetch_delta_candles(BTC_SYMBOL, "1d", hours_back=4320, closed_only=True)  # 180 days
-        if not df_1d.empty and len(df_1d) >= 5:
-            pools_1d_1w = _extract_tf_pools(df_1d, "1D", w=1, eq_tol=150.0, max_bars_back=180)
-            pdh = float(df_1d["h"].iloc[-1])
-            pdl = float(df_1d["l"].iloc[-1])
-            pd_t = int(df_1d["time"].iloc[-1])
-            pools_1d_1w.append({"id": f"1D_PDH_{int(pdh)}_{pd_t}", "tf": "1D", "side": "BSL", "pivot": pdh, "is_eq": False, "why": f"Previous Day High PDH (${pdh:,.1f})"})
-            pools_1d_1w.append({"id": f"1D_PDL_{int(pdl)}_{pd_t}", "tf": "1D", "side": "SSL", "pivot": pdl, "is_eq": False, "why": f"Previous Day Low PDL (${pdl:,.1f})"})
-
-            # Resample Weekly (1W) from 1D
-            df_1w = (
-                df_1d.set_index("ts_utc")
-                .resample("1W")
-                .agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"})
-                .dropna()
-                .reset_index()
-            )
-            if len(df_1w) >= 3:
-                df_1w["time"] = (df_1w["ts_utc"].astype("int64") // 10**9).astype(int)
-                pools_1w = _extract_tf_pools(df_1w, "1W", w=1, eq_tol=250.0, max_bars_back=26)
-                pwh = float(df_1w["h"].iloc[-2]) if len(df_1w) >= 2 else float(df_1w["h"].iloc[-1])
-                pwl = float(df_1w["l"].iloc[-2]) if len(df_1w) >= 2 else float(df_1w["l"].iloc[-1])
-                pw_t = int(df_1w["time"].iloc[-1])
-                pools_1w.append({"id": f"1W_PWH_{int(pwh)}_{pw_t}", "tf": "1W", "side": "BSL", "pivot": pwh, "is_eq": False, "why": f"Previous Week High PWH (${pwh:,.1f})"})
-                pools_1w.append({"id": f"1W_PWL_{int(pwl)}_{pw_t}", "tf": "1W", "side": "SSL", "pivot": pwl, "is_eq": False, "why": f"Previous Week Low PWL (${pwl:,.1f})"})
-                pools_1d_1w.extend(pools_1w)
-
-    # Combine & deduplicate with priority: 1W > 1D > 4H > 1H
-    tf_prio = {"1W": 4, "1D": 3, "4H": 2, "1H": 1}
-    raw_all = pools_1d_1w + pools_4h + pools_1h
-    raw_all.sort(key=lambda z: (tf_prio.get(z["tf"], 0), -abs(z["pivot"] - ltp)), reverse=True)
-
-    dedup = []
-    for z in raw_all:
-        if state.is_spent("spent_pools", z["id"]):
+def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_5m: pd.DataFrame, ltp: float, now_ist: datetime, state: GoldState) -> list:
+    specs = [
+        (df_1d, "1D_BLUE_BOX", 3, 2, 1.3, 1),
+        (df_4h, "4H_BLUE_BOX", 5, 2, 1.7, 2),
+        (df_1h, "1H_BLUE_BOX", 6, 3, 1.9, 3),
+    ]
+    raw_boxes = []
+    for df, tf_lbl, lb, rb, rev_mult, prio in specs:
+        if df is None or df.empty or len(df) < lb + rb + 2:
             continue
-        # Keep only pools within $4,500 of LTP
-        if abs(z["pivot"] - ltp) > 4500.0:
-            continue
-        # Deduplicate clusters within $80 of a higher-timeframe pool
-        if not any(abs(z["pivot"] - ez["pivot"]) <= 80.0 and z["side"] == ez["side"] for ez in dedup):
-            dedup.append(z)
+        sc = _median_range(df, 20)
+        hh, ll, cc = df["h"].values, df["l"].values, df["c"].values
+        for k in range(lb, len(df) - rb):
+            formed_t = _ensure_ist(df["ts"].iloc[k])
+            age_d = max(0, (now_ist - formed_t).days)
+            if age_d > MAX_ZONE_AGE_DAYS:
+                continue
 
-    # Count EQH (BSL above LTP) and EQL (SSL below LTP)
-    bsl_pools = sorted([z for z in dedup if z["side"] == "BSL" and z["pivot"] >= ltp], key=lambda x: x["pivot"])
-    ssl_pools = sorted([z for z in dedup if z["side"] == "SSL" and z["pivot"] <= ltp], key=lambda x: x["pivot"], reverse=True)
-    eqh_count = sum(1 for z in bsl_pools if z.get("is_eq"))
-    eql_count = sum(1 for z in ssl_pools if z.get("is_eq"))
+            if hh[k] == np.max(hh[k - lb : k + rb + 1]):
+                rev = float(hh[k] - np.min(ll[k + 1 : k + rb + 1]))
+                sub_h, sub_c = hh[k + rb + 1 : -1], cc[k + rb + 1 : -1]
+                if rev >= rev_mult * sc and (len(sub_h) == 0 or (np.max(sub_h) <= hh[k] and np.max(sub_c) <= hh[k])):
+                    zid = f"{tf_lbl}_H_{int(hh[k]*100)}_{formed_t.strftime('%Y%m%d%H')}"
+                    if not state.is_spent(zid) and abs(hh[k] - ltp) <= DEEP_BAND_USD:
+                        raw_boxes.append({
+                            "id": zid, "type": "RESISTANCE", "tf": tf_lbl, "prio": prio,
+                            "pivot": round(float(hh[k]), 2), "age_days": age_d, "touches": 1,
+                            "flipped": False, "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ ${hh[k]:.2f}"
+                        })
 
-    high_24h = float(df_1h.tail(24)["h"].max())
-    low_24h = float(df_1h.tail(24)["l"].min())
+            if ll[k] == np.min(ll[k - lb : k + rb + 1]):
+                rev = float(np.max(hh[k + 1 : k + rb + 1]) - ll[k])
+                sub_l, sub_c = ll[k + rb + 1 : -1], cc[k + rb + 1 : -1]
+                if rev >= rev_mult * sc and (len(sub_l) == 0 or (np.min(sub_l) >= ll[k] and np.min(sub_c) >= ll[k])):
+                    zid = f"{tf_lbl}_L_{int(ll[k]*100)}_{formed_t.strftime('%Y%m%d%H')}"
+                    if not state.is_spent(zid) and abs(ll[k] - ltp) <= DEEP_BAND_USD:
+                        raw_boxes.append({
+                            "id": zid, "type": "SUPPORT", "tf": tf_lbl, "prio": prio,
+                            "pivot": round(float(ll[k]), 2), "age_days": age_d, "touches": 1,
+                            "flipped": False, "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ ${ll[k]:.2f}"
+                        })
 
-    macro_snapshot = {
-        "ltp": ltp,
-        "t6": t6,
-        "ema20_6h": round(ema20_6h, 1),
-        "t4": t4,
-        "ema50_4h": round(ema50_4h, 1),
-        "struct_bias": struct_bias,
-        "pdh": pdh,
-        "pdl": pdl,
-        "high_24h": high_24h,
-        "low_24h": low_24h,
-        "bsl_count": len(bsl_pools),
-        "ssl_count": len(ssl_pools),
-        "eqh_count": eqh_count,
-        "eql_count": eql_count,
-        "nearest_bsl": bsl_pools[:4],
-        "nearest_ssl": ssl_pools[:4],
-    }
+    # Current-Day Real-Time Dynamic Zones (5M untouched swings formed TODAY)
+    if df_5m is not None and len(df_5m) >= 12:
+        today_str = now_ist.strftime("%Y-%m-%d")
+        df_today = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") == today_str].reset_index(drop=True)
+        if len(df_today) >= 8:
+            sc5 = _median_range(df_today, 15)
+            hh5, ll5, cc5 = df_today["h"].values, df_today["l"].values, df_today["c"].values
+            for k in range(3, len(df_today) - 2):
+                ft = _ensure_ist(df_today["ts"].iloc[k])
+                if hh5[k] == np.max(hh5[k - 3 : k + 3]) and (hh5[k] - np.min(ll5[k + 1 : k + 3])) >= 1.2 * sc5:
+                    if len(hh5[k + 3 : -1]) == 0 or (np.max(hh5[k + 3 : -1]) <= hh5[k] and np.max(cc5[k + 3 : -1]) <= hh5[k]):
+                        zid = f"CURR_DAY_H_{int(hh5[k]*100)}_{ft.strftime('%H%M')}"
+                        if not state.is_spent(zid):
+                            raw_boxes.append({
+                                "id": zid, "type": "RESISTANCE", "tf": "CURRENT_DAY_5M", "prio": 4,
+                                "pivot": round(float(hh5[k]), 2), "age_days": 0, "touches": 1,
+                                "flipped": False, "source": "CURRENT_DAY_DYNAMIC", "why": f"Today {ft.strftime('%H:%M')} Swing High @ ${hh5[k]:.2f}"
+                            })
+                if ll5[k] == np.min(ll5[k - 3 : k + 3]) and (np.max(hh5[k + 1 : k + 3]) - ll5[k]) >= 1.2 * sc5:
+                    if len(ll5[k + 3 : -1]) == 0 or (np.min(ll5[k + 3 : -1]) >= ll5[k] and np.min(cc5[k + 3 : -1]) >= ll5[k]):
+                        zid = f"CURR_DAY_L_{int(ll5[k]*100)}_{ft.strftime('%H%M')}"
+                        if not state.is_spent(zid):
+                            raw_boxes.append({
+                                "id": zid, "type": "SUPPORT", "tf": "CURRENT_DAY_5M", "prio": 4,
+                                "pivot": round(float(ll5[k]), 2), "age_days": 0, "touches": 1,
+                                "flipped": False, "source": "CURRENT_DAY_DYNAMIC", "why": f"Today {ft.strftime('%H:%M')} Swing Low @ ${ll5[k]:.2f}"
+                            })
 
-    state.set("htf_pools", dedup[:25], ttl=86400)
-    state.set("macro_snapshot", macro_snapshot, ttl=86400)
-    return macro_snapshot
+    # Merge AI-saved zones
+    for az in (state.get("ai_zones") or []):
+        if not state.is_spent(az["id"]) and abs(float(az["pivot"]) - ltp) <= DEEP_BAND_USD:
+            raw_boxes.append(az)
+
+    raw_boxes.sort(key=lambda x: (x.get("prio", 3), abs(float(x["pivot"]) - ltp)))
+    merged = []
+    for cand in raw_boxes:
+        m = next((x for x in merged if x["type"] == cand["type"] and not x.get("flipped") and abs(float(x["pivot"]) - float(cand["pivot"])) <= SHELF_MERGE_USD), None)
+        if m:
+            m["touches"] = m.get("touches", 1) + 1
+            m["age_days"] = max(m.get("age_days", 0), cand.get("age_days", 0))
+            m["pivot"] = round(max(float(m["pivot"]), float(cand["pivot"])) if cand["type"] == "RESISTANCE" else min(float(m["pivot"]), float(cand["pivot"])), 2)
+        else:
+            merged.append(cand)
+
+    merged.sort(key=lambda z: (z.get("prio", 3), -z.get("touches", 1), abs(float(z["pivot"]) - ltp)))
+    return merged[:22]
 
 
 # ==============================================================================
-# TIER-1 HEAVY MACRO AUDIT + 23:30 IST DEDICATED BACKGROUND THREAD
+# DYNAMIC HISTORICAL PRICE-BAND SLICE (ZONE VACUUM < 2 ZONES IN LTP ± $100)
 # ==============================================================================
-MACRO_SYS_PROMPT = (
-    "You are the Lead Institutional BTCUSD Liquidity & Market Structure Analyst.\n"
-    "Analyze the 6H/4H trend alignment and un-swept 1W/1D/4H/1H liquidity pools (BSL above vs SSL below) plus EQH/EQL clusters.\n"
-    "Determine macro directional bias and which 1H liquidity sweeps are safe for the next 6 hours.\n"
+BAND_SLICE_SYS_PROMPT = (
+    "You are the Gold (XAUTUSD) Historical Liquidity Archaeologist (100% Pure Price Action — No Indicators).\n"
+    "Gold moved into an area with fewer than 2 nearby untouched zones.\n"
+    "Analyze ONLY the supplied historical candles inside LTP ± $200 + today's intraday candles.\n"
+    "Identify untouched historical Blue Boxes (Swing Highs/Lows) and current-day dynamic zones.\n"
     "Respond ONLY in strictly valid JSON:\n"
-    '{"macro_bias": "BULLISH|BEARISH|RANGE", "allowed_1h_sweep": "LONG_ONLY|SHORT_ONLY|BOTH", '
-    '"liquidity_magnet": "Nearest major un-swept pool price & side", "assessment": "1-2 crisp sentences"}'
+    '{"regime_update": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "HIST_1D|HIST_4H|CURR_DAY", "pivot": 0.0, "why": "short reason"}]}'
 )
 
 
-def _build_macro_user_prompt(snap: dict, now_ist: datetime) -> str:
-    bsl_str = ", ".join([f"{z['why']}" for z in snap.get("nearest_bsl", [])[:3]]) or "None nearby"
-    ssl_str = ", ".join([f"{z['why']}" for z in snap.get("nearest_ssl", [])[:3]]) or "None nearby"
-    return (
-        f"Asset: BTCUSD | Time: {now_ist.strftime('%Y-%m-%d %H:%M IST')} | LTP: ${snap['ltp']:,.1f}\n"
-        f"6H Trend (EMA20): {snap['t6']} (${snap['ema20_6h']:,.1f}) | 4H Trend (EMA50): {snap['t4']} (${snap['ema50_4h']:,.1f})\n"
-        f"Structural Regime: {snap['struct_bias']} | 24h Range: ${snap['low_24h']:,.1f} - ${snap['high_24h']:,.1f}\n"
-        f"Liquidity Pool Counter: BSL Above = {snap['bsl_count']} (EQH: {snap['eqh_count']}) | SSL Below = {snap['ssl_count']} (EQL: {snap['eql_count']})\n"
-        f"Nearest Overhead BSL Pools: {bsl_str}\n"
-        f"Nearest Below SSL Pools: {ssl_str}"
+def _run_historical_band_slice_worker(shared_store, ltp: float, df_5m: pd.DataFrame):
+    state = GoldState(shared_store)
+    now = datetime.now(IST)
+    low_b, high_b = round(ltp - DEEP_BAND_USD, 2), round(ltp + DEEP_BAND_USD, 2)
+
+    df_1d_3y = fetch_delta_candles("1d", hours_back=24 * 1095, closed_only=True)
+    df_4h_11m = fetch_delta_candles("4h", hours_back=24 * 330, closed_only=True)
+
+    hist_hits = []
+    for df_h, lbl in [(df_1d_3y, "1D"), (df_4h_11m, "4H")]:
+        if df_h is None or df_h.empty:
+            continue
+        in_band = df_h[(df_h["h"] >= low_b) & (df_h["l"] <= high_b)].tail(35)
+        for _, r in in_band.iterrows():
+            dt_s = _ensure_ist(r["ts"]).strftime("%Y-%m-%d %H:%M")
+            hist_hits.append(f"{lbl} {dt_s}: O={r['o']} H={r['h']} L={r['l']} C={r['c']}")
+
+    if not hist_hits:
+        log.info(f"[GOLD] 🚀 Uncharted Price / New High @ ${ltp:.2f} (0 historical bars in ${low_b}-${high_b}). Running Current-Day Dynamic Mode.")
+        tg_send(
+            f"🚀 <b>[GOLD NEW PRICE TERRITORY] ${ltp:.2f}</b>\n"
+            f"• 3-Year historical data has 0 candles in <code>${low_b}–${high_b}</code>.\n"
+            f"• Switched automatically to <b>Current-Day Dynamic Zones + 15M Trend Pullback Liquidity Hunts</b>."
+        )
+        return
+
+    base_p = round(math.floor(low_b / 50.0) * 50.0, 2)
+    today_str = now.strftime("%Y-%m-%d")
+    df_today = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") == today_str] if (df_5m is not None and not df_5m.empty) else pd.DataFrame()
+    today_delta = encode_delta_candles(df_today, 60, base_p, "%H:%M")
+
+    usr_p = (
+        f"Asset: GOLD (XAUTUSD) | LTP: ${ltp:.2f} | Band: ${low_b} to ${high_b} (±${int(DEEP_BAND_USD)})\n"
+        f"Historical Candles Inside Band ({len(hist_hits)} bars):\n" + "\n".join(hist_hits[:45]) + "\n\n"
+        f"Current Day 5M Candles (Base=${base_p}):\n" + "\n".join(today_delta)
+    )
+
+    ai_res, provider = call_gemini_chain(HEAVY_AI_CHAIN, BAND_SLICE_SYS_PROMPT, usr_p)
+    if not ai_res or not isinstance(ai_res.get("zones"), list):
+        return
+
+    existing_ai = state.get("ai_zones") or []
+    added = []
+    for idx, z in enumerate(ai_res["zones"][:10]):
+        try:
+            piv = round(float(z["pivot"]), 2)
+            ztype = str(z.get("type", "RESISTANCE")).upper()
+            if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
+                continue
+            zid = f"AI_BAND_{ztype[:3]}_{int(piv*100)}_{now.strftime('%H%M')}_{idx}"
+            item = {
+                "id": zid, "type": ztype, "tf": str(z.get("tf", "HIST_1D")), "prio": 2,
+                "pivot": piv, "age_days": 30, "touches": 1, "flipped": False,
+                "source": "AI_HISTORICAL_BAND", "why": str(z.get("why", "Historical Band Blue Box"))
+            }
+            existing_ai.append(item)
+            added.append(item)
+        except Exception:
+            continue
+
+    if added:
+        state.set("ai_zones", existing_ai[-30:], ttl=86400)
+        lines = [f"• <b>{z['type']}</b> @ <code>${z['pivot']:.2f}</code> ({esc(z['why'])})" for z in added[:5]]
+        tg_send(
+            f"🧭 <b>[GOLD DEEP BAND SYNC | {esc(provider)}]</b>\n"
+            f"• Zone Vacuum (&lt;2 zones in ±$100) triggered 3-Yr Band Slice (<code>${low_b}–${high_b}</code>)\n"
+            f"• Added <b>{len(added)}</b> Historical + Current-Day Blue Boxes for Python tracking:\n" + "\n".join(lines)
+        )
+
+
+def check_zone_vacuum_and_trigger_band(state: GoldState, zones: list, ltp: float, df_5m: pd.DataFrame):
+    nearby = [z for z in zones if abs(float(z["pivot"]) - ltp) <= VACUUM_RADIUS_USD]
+    if len(nearby) >= 2:
+        return
+    band_bucket = int(round(ltp / 100.0) * 100)
+    lock_key = f"band_slice_lock_{band_bucket}"
+    if state.get(lock_key):
+        return
+    state.set(lock_key, True, ttl=3600)
+    log.info(f"[GOLD] Zone Vacuum detected (<2 zones in ${ltp:.2f} ± ${VACUUM_RADIUS_USD}). Launching Historical Band Slice...")
+    threading.Thread(
+        target=_run_historical_band_slice_worker,
+        args=(state.store, ltp, df_5m),
+        daemon=True,
+    ).start()
+
+
+# ==============================================================================
+# SCHEDULED 23:30 BIG ANALYSIS + EVERY 6 HOURS SYNC (05:30, 11:30, 17:30 IST)
+# ==============================================================================
+MACRO_6H_SYS_PROMPT = (
+    "You are the Gold (XAUTUSD) Institutional Pure Liquidity Architect (1D -> 4H -> 1H -> 15M -> 5M).\n"
+    "Zero EMA/RSI/ATR. Analyze market structure, determine regime, and mark untouched Blue Boxes "
+    "(including current-day newly formed liquidity zones in the last 6 hours) for Python to track.\n"
+    "All candle values are delta-encoded from BASE (real price = delta + BASE).\n"
+    "Respond ONLY in strictly valid JSON:\n"
+    '{"regime": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
+    '"if_then_plan": "1 concise sentence IF-THEN liquidity plan", '
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "1D|4H|1H|CURR_DAY", "pivot": 0.0, "why": "short reason"}]}'
+)
+
+
+def _execute_6h_macro_worker(shared_store, is_daily_2330: bool):
+    state = GoldState(shared_store)
+    now = datetime.now(IST)
+
+    df_1d = fetch_delta_candles("1d", hours_back=24 * 90, closed_only=True) if is_daily_2330 else None
+    df_4h = fetch_delta_candles("4h", hours_back=24 * (90 if is_daily_2330 else 15), closed_only=True)
+    df_1h = fetch_delta_candles("1h", hours_back=24 * (30 if is_daily_2330 else 7), closed_only=True)
+    df_15m = fetch_delta_candles("15m", hours_back=24 * (7 if is_daily_2330 else 3), closed_only=True)
+    df_5m = fetch_delta_candles("5m", hours_back=48, closed_only=True)
+
+    if df_5m.empty or df_1h.empty:
+        return
+
+    ltp = float(df_5m["c"].iloc[-1])
+    pa_regime = get_pure_pa_regime(df_4h, df_1h)
+    py_zones = extract_pure_blue_boxes(df_1d, df_4h, df_1h, df_5m, ltp, now, state)
+    state.set("active_zones", py_zones, ttl=86400)
+    state.set("regime", pa_regime, ttl=25200)
+
+    title = "23:30 IST DAILY BIG MULTI-TF ANALYSIS" if is_daily_2330 else f"6-HOUR INTRADAY LIQUIDITY SYNC ({now.strftime('%H:%M IST')})"
+    near_txt = "\n".join([f"• <b>{z['type']}</b> ({z['tf']}): <code>${z['pivot']:.2f}</code>" for z in py_zones[:4]]) or "• None within $200"
+
+    tg_send(
+        f"🏛️ <b>[GOLD - XAUTUSD] {title}</b>\n"
+        f"📊 <b>LTP:</b> <b>${ltp:.2f}</b> | <b>PA Regime:</b> <code>{pa_regime}</code> | <b>Zones:</b> <code>{len(py_zones)}</code>\n"
+        f"{near_txt}\n⏳ <i>Running {esc(HYDROGEN_MODEL)} background zone sync...</i>"
+    )
+
+    base_p = round(math.floor(ltp / 50.0) * 50.0, 2)
+    usr_p = (
+        f"Asset: GOLD (XAUTUSD) | Mode: {title} | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | LTP: ${ltp:.2f}\n"
+        f"Base Price for Delta Decoding: ${base_p}\n"
+        f"Python Pre-Detected Zones: {json.dumps([{'type': z['type'], 'tf': z['tf'], 'pivot': z['pivot'], 'age_d': z['age_days']} for z in py_zones[:10]])}\n"
+        + (f"1D Candles (30): {encode_delta_candles(df_1d, 30, base_p, '%Y-%m-%d')}\n" if df_1d is not None and not df_1d.empty else "")
+        + f"4H Candles: {encode_delta_candles(df_4h, 45 if is_daily_2330 else 18, base_p)}\n"
+        + f"1H Candles: {encode_delta_candles(df_1h, 48 if is_daily_2330 else 36, base_p)}\n"
+        + f"15M Candles: {encode_delta_candles(df_15m, 32, base_p)}\n"
+        + f"5M Candles (Last 6H=72 bars): {encode_delta_candles(df_5m, 48 if is_daily_2330 else 72, base_p)}"
+    )
+
+    ai_res, provider = call_gemini_chain(HEAVY_AI_CHAIN, MACRO_6H_SYS_PROMPT, usr_p)
+    if not ai_res:
+        log.warning(f"[GOLD] 6H/Macro AI unreachable ({provider}); Python zones remain active.")
+        return
+
+    ai_regime = ai_res.get("regime", pa_regime)
+    state.set("regime", ai_regime, ttl=25200)
+    ai_saved = state.get("ai_zones") or []
+    new_cnt = 0
+    for idx, z in enumerate((ai_res.get("zones") or [])[:12]):
+        try:
+            piv = round(float(z["pivot"]), 2)
+            ztype = str(z.get("type", "RESISTANCE")).upper()
+            if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
+                continue
+            zid = f"AI_6H_{ztype[:3]}_{int(piv*100)}_{now.strftime('%Y%m%d_%H')}_{idx}"
+            ai_saved.append({
+                "id": zid, "type": ztype, "tf": str(z.get("tf", "CURR_DAY")), "prio": 2,
+                "pivot": piv, "age_days": 0, "touches": 1, "flipped": False,
+                "source": "AI_6H_SYNC", "why": str(z.get("why", "AI Marked Blue Box"))
+            })
+            new_cnt += 1
+        except Exception:
+            continue
+
+    if new_cnt:
+        state.set("ai_zones", ai_saved[-35:], ttl=86400)
+        refreshed = extract_pure_blue_boxes(df_1d, df_4h, df_1h, df_5m, ltp, now, state)
+        state.set("active_zones", refreshed, ttl=86400)
+
+    tg_send(
+        f"🧠 <b>[GOLD AI ZONE SYNC | {esc(provider)}]</b>\n"
+        f"🧭 <b>AI Regime:</b> <b>{esc(ai_regime)}</b> | <b>Saved Zones:</b> <code>{new_cnt}</code>\n"
+        f"📋 <b>Plan:</b> <i>{esc(ai_res.get('if_then_plan', 'Tracking Blue Box -> Yellow Box hunts.'))}</i>"
     )
 
 
-def _hydrogen_macro_retry_worker(shared_store, slot_key: str, snap: dict):
-    """Background retry worker every 2 mins until gemini-4-hydrogen confirms the 23:30 IST macro map."""
-    for attempt in range(1, 16):
-        time.sleep(120)
-        state = BtcState(shared_store)
-        if state.get(f"{slot_key}_hydrogen_ok"):
-            return
-        now = datetime.now(IST)
-        usr_p = _build_macro_user_prompt(snap, now)
-        res = _call_single_gemini_model(HYDROGEN_MODEL, "HIGH", 300, MACRO_SYS_PROMPT, usr_p, 500)
-        if res is not None:
-            state.set(f"{slot_key}_hydrogen_ok", True, ttl=43200)
-            state.set("macro_bias", res.get("macro_bias", snap["struct_bias"]), ttl=25200)
-            state.set("allowed_1h_sweep", res.get("allowed_1h_sweep", "BOTH"), ttl=25200)
-            msg = (
-                f"🧠 <b>[HYDROGEN MACRO CONFIRMATION | {now.strftime('%H:%M IST')}]</b>\n\n"
-                f"🏛️ <b>Bias:</b> <b>{esc(res.get('macro_bias'))}</b> | <b>1H Rule:</b> <code>{esc(res.get('allowed_1h_sweep'))}</code>\n"
-                f"🧲 <b>Liquidity Magnet:</b> <code>{esc(res.get('liquidity_magnet'))}</code>\n"
-                f"<i>{esc(res.get('assessment'))}</i>"
-            )
-            tg_send(msg)
-            log.info(f"[BTC] ✅ Hydrogen background macro confirmation succeeded on retry #{attempt}")
-            return
-
-
-def _execute_macro_sync_worker(shared_store, is_daily_2330: bool, slot_key: str):
-    state = BtcState(shared_store)
-    now = datetime.now(IST)
-    snap = sync_htf_liquidity_pools(state, include_1d_1w=is_daily_2330)
-    if not snap:
-        return
-
-    usr_p = _build_macro_user_prompt(snap, now)
-    ai_res, provider = call_ai_chain(HEAVY_AI_CHAIN, MACRO_SYS_PROMPT, usr_p, max_tokens=500)
-
-    if not ai_res:
-        # Deterministic fallback to pure 6H/4H structure so live engine never stalls
-        ai_bias = snap["struct_bias"]
-        allowed_1h = "LONG_ONLY" if ai_bias == "BULLISH" else ("SHORT_ONLY" if ai_bias == "BEARISH" else "BOTH")
-        ai_text = f"6H ({snap['t6']}) & 4H ({snap['t4']}) structure active; AI heavy chain unreachable."
-        magnet = snap["nearest_bsl"][0]["why"] if ai_bias == "BULLISH" and snap["nearest_bsl"] else (snap["nearest_ssl"][0]["why"] if snap["nearest_ssl"] else "N/A")
-        provider = "STRUCTURE_FALLBACK"
-    else:
-        ai_bias = ai_res.get("macro_bias", snap["struct_bias"])
-        allowed_1h = ai_res.get("allowed_1h_sweep", "BOTH")
-        ai_text = ai_res.get("assessment", "")
-        magnet = ai_res.get("liquidity_magnet", "N/A")
-
-    state.set("macro_bias", ai_bias, ttl=25200)
-    state.set("allowed_1h_sweep", allowed_1h, ttl=25200)
-
-    title = "23:30 IST DAILY 1D+4H+1H LIQUIDITY MAP" if is_daily_2330 else f"INTRADAY 4H-1H LIQUIDITY SYNC ({now.strftime('%H:%M IST')})"
-    bsl_lines = [f"• <b>BSL:</b> {esc(z['why'])}" for z in snap.get("nearest_bsl", [])[:2]]
-    ssl_lines = [f"• <b>SSL:</b> {esc(z['why'])}" for z in snap.get("nearest_ssl", [])[:2]]
-
-    msg = f"""🏛️ <b>[BITCOIN] {title}</b>
-
-📊 <b>LTP      :</b> <b>${snap['ltp']:,.1f}</b> | <b>Bias:</b> <b>{esc(ai_bias)}</b>
-🧭 <b>Structure:</b> <code>6H: {snap['t6']} | 4H: {snap['t4']} | 1H Rule: {esc(allowed_1h)}</code>
-💧 <b>Pool Map :</b> <code>BSL Above: {snap['bsl_count']} (EQH:{snap['eqh_count']}) | SSL Below: {snap['ssl_count']} (EQL:{snap['eql_count']})</code>
-
-🗺️ <b>Nearest Un-Swept HTF Liquidity:</b>
-{chr(10).join(bsl_lines + ssl_lines) if (bsl_lines or ssl_lines) else '• None within $4,500'}
-
-🧲 <b>Magnet   :</b> <code>{esc(magnet)}</code>
-🧠 <b>AI ({esc(provider)}):</b> <i>{esc(ai_text)}</i>"""
-
-    tg_send(msg)
-    log.info(f"[BTC] 🏛️ Macro sync published via {provider} (Bias: {ai_bias})")
-
-    # If 23:30 IST daily job did NOT get gemini-4-hydrogen on first pass, auto-retry Hydrogen every 2 mins in background
-    if is_daily_2330:
-        if HYDROGEN_MODEL in provider:
-            state.set(f"{slot_key}_hydrogen_ok", True, ttl=43200)
-        else:
-            log.info(f"[BTC] Scheduling 2-min background auto-retry for {HYDROGEN_MODEL}...")
-            t_retry = threading.Thread(
-                target=_hydrogen_macro_retry_worker,
-                args=(shared_store, slot_key, snap),
-                daemon=True,
-            )
-            t_retry.start()
-
-
-def trigger_macro_sync_if_due(shared_store=None, force: bool = False):
-    """
-    Runs 23:30 IST 1D+4H+1H job and 3x Intraday 4H-1H sync (05:30, 11:30, 17:30 IST)
-    in a non-blocking background thread with shared deduplication lock.
-    """
-    state = BtcState(shared_store)
+def trigger_6h_macro_if_due(shared_store=None, force: bool = False):
+    state = GoldState(shared_store)
     now = datetime.now(IST)
     slot_hours = [5, 11, 17, 23]
-
-    cur_hour = None
-    if force:
-        cur_hour = now.hour
-    else:
-        for h in slot_hours:
-            if now.hour == h and 30 <= now.minute < 55:
-                cur_hour = h
-                break
-
-    if cur_hour is None:
+    cur_h = now.hour if force else (now.hour if (now.hour in slot_hours and 30 <= now.minute <= 50) else None)
+    if cur_h is None:
         return
 
-    slot_key = f"macro_slot_done_{now.strftime('%Y-%m-%d')}_{cur_hour}"
+    slot_key = f"macro_6h_done_{now.strftime('%Y-%m-%d')}_{cur_h}"
     if not force and state.get(slot_key):
         return
-
     state.set(slot_key, True, ttl=21600)
-    is_daily_2330 = (cur_hour == 23) or force
-    t = threading.Thread(
-        target=_execute_macro_sync_worker,
-        args=(shared_store, is_daily_2330, slot_key),
+    is_daily_2330 = (cur_h == 23) or force
+    threading.Thread(
+        target=_execute_6h_macro_worker,
+        args=(shared_store, is_daily_2330),
         daemon=True,
-    )
-    t.start()
+    ).start()
 
 
 # ==============================================================================
-# 3 VALIDATED PURE FORMAL LIQUIDITY SETUPS (ENTRY-ONLY IDENTIFICATION)
+# PURE LIQUIDITY SETUP DETECTOR (5M HTF/SHELF/PT10/FLIP/DUAL + 15M PULLBACK)
 # ==============================================================================
+def _check_yellow_box_reclaim(df: pd.DataFrame, pivot: float, action: str, tol: float = ZONE_BUFFER_USD):
+    if len(df) < 3:
+        return False, 0.0, ""
+    c1, c2 = df.iloc[-1], df.iloc[-2]
+    o1, h1, l1, cl1 = float(c1["o"]), float(c1["h"]), float(c1["l"]), float(c1["c"])
+    o2, h2, l2, cl2 = float(c2["o"]), float(c2["h"]), float(c2["l"]), float(c2["c"])
+    rng1 = max(h1 - l1, 0.05)
+    up_w1, dn_w1 = (h1 - max(o1, cl1)) / rng1, (min(o1, cl1) - l1) / rng1
 
-# SETUP 1: BIG_SR_SWEEP [1W, 1D, 4H, 1H] (First-Touch Un-swept Pool Sweep)
-def check_big_sr_and_1h_sweep(df_5m: pd.DataFrame, state: BtcState, macro_bias: str, allowed_1h: str):
-    if len(df_5m) < 10:
-        return None
+    if action == "BUY_LONG":
+        if up_w1 > 0.38 and cl1 < h1 - rng1 * 0.35:
+            return False, 0.0, ""
+        if l1 <= pivot + tol and cl1 > pivot and (cl1 > o1 or dn_w1 >= 0.45):
+            return True, l1, f"1-Bar Yellow Box Sweep (${l1:.2f} <= ${pivot:.2f}) & Reclaim (${cl1:.2f})"
+        low_2c = min(l1, l2)
+        if low_2c <= pivot + tol and cl1 > o1 and cl1 > pivot and cl1 >= max(o2, cl2) - 0.50:
+            return True, low_2c, f"2-Bar Yellow Box Sweep (${low_2c:.2f} <= ${pivot:.2f}) & Reclaim (${cl1:.2f})"
 
-    pools = state.get("htf_pools") or []
-    if not pools:
-        return None
+    elif action == "SELL_SHORT":
+        if dn_w1 > 0.38 and cl1 > l1 + rng1 * 0.35:
+            return False, 0.0, ""
+        if h1 >= pivot - tol and cl1 < pivot and (cl1 < o1 or up_w1 >= 0.45):
+            return True, h1, f"1-Bar Yellow Box Sweep (${h1:.2f} >= ${pivot:.2f}) & Reject (${cl1:.2f})"
+        high_2c = max(h1, h2)
+        if high_2c >= pivot - tol and cl1 < o1 and cl1 < pivot and cl1 <= min(o2, cl2) + 0.50:
+            return True, high_2c, f"2-Bar Yellow Box Sweep (${high_2c:.2f} >= ${pivot:.2f}) & Reject (${cl1:.2f})"
 
-    i = len(df_5m) - 1
-    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
-    rng = max(h - l, 1.0)
-    upper_wick = (h - max(o, c)) / rng
-    lower_wick = (min(o, c) - l) / rng
+    return False, 0.0, ""
 
-    tf_prio = {"1W": 4, "1D": 3, "4H": 2, "1H": 1}
-    candidates = []
-    pools_updated = False
 
-    for p in pools:
-        pid = p["id"]
-        if state.is_spent("spent_pools", pid):
+def detect_gold_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones: list, regime: str, state: GoldState):
+    ltp = float(m5["c"].iloc[-1])
+    sc5 = _median_range(m5, 20)
+    o1, h1, l1, cl1 = float(m5["o"].iloc[-1]), float(m5["h"].iloc[-1]), float(m5["l"].iloc[-1]), ltp
+    rng1 = max(h1 - l1, 0.05)
+    up_w1, dn_w1 = (h1 - max(o1, cl1)) / rng1, (min(o1, cl1) - l1) / rng1
+
+    # Update polarity flips on broken 1D/4H/1H zones
+    zones_changed = False
+    for b in zones:
+        if not b.get("flipped") and b.get("tf") in ("1D_BLUE_BOX", "4H_BLUE_BOX", "1H_BLUE_BOX"):
+            piv = float(b["pivot"])
+            if b["type"] == "RESISTANCE" and cl1 > piv + FLIP_BREAK_USD and float(m5["c"].iloc[-2]) > piv + 1.0:
+                b["type"] = "SUPPORT"
+                b["flipped"] = True
+                zones_changed = True
+            elif b["type"] == "SUPPORT" and cl1 < piv - FLIP_BREAK_USD and float(m5["c"].iloc[-2]) < piv - 1.0:
+                b["type"] = "RESISTANCE"
+                b["flipped"] = True
+                zones_changed = True
+    if zones_changed:
+        state.set("active_zones", zones, ttl=86400)
+
+    # Point #10 Exhaustion Momentum Check
+    c_tail = m5.iloc[-4:-1]
+    prev_bar = m5.iloc[-2]
+    big_up_in = (int((c_tail["c"] > c_tail["o"]).sum()) == 3) or ((float(prev_bar["c"]) - float(prev_bar["o"])) >= 2.2 * sc5)
+    big_dn_in = (int((c_tail["c"] < c_tail["o"]).sum()) == 3) or ((float(prev_bar["o"]) - float(prev_bar["c"])) >= 2.2 * sc5)
+
+    # 1. Persistent Old / HTF Blue Boxes + Multi-Touch Shelf + Point #10 Exhaustion + Breakout Flip + Current-Day Dynamic Zones
+    for b in zones:
+        zid = b["id"]
+        if state.is_spent(zid):
             continue
+        lvl = float(b["pivot"])
+        if abs(lvl - ltp) > 12.0:
+            continue
+        action = "SELL_SHORT" if b["type"] == "RESISTANCE" else "BUY_LONG"
 
-        lvl = float(p["pivot"])
-        tf = p["tf"]
-
-        # Buy-Side Liquidity (BSL / High) pierced -> First-touch consumes pool
-        if p["side"] == "BSL" and h > lvl:
-            state.mark_spent("spent_pools", pid)
-            pools_updated = True
-            if c < lvl and upper_wick >= 0.30 and c <= o:
-                # 1H sweep allowed only when aligned with macro trend or RANGE
-                if tf == "1H" and (macro_bias == "BULLISH" or allowed_1h == "LONG_ONLY"):
-                    continue
-                sweep_depth = round((h + 25.0) - c, 1)
-                if 60.0 <= sweep_depth <= 380.0:
-                    candidates.append((
-                        tf_prio.get(tf, 1),
-                        {
-                            "name": f"BIG_SR_SWEEP [{tf}]",
-                            "action": "SELL_SHORT",
-                            "tier": f"Tier-1 {tf} Liquidity Pool Sweep (First-Touch)",
-                            "entry": c,
-                            "wick_extreme": h,
-                            "invalidation_ref": round(h + 25.0, 1),
-                            "sweep_depth": sweep_depth,
-                            "wick_pct": int(upper_wick * 100),
-                            "swept_tf": tf,
-                            "swept_level": lvl,
-                            "why": f"Swept {p['why']} with {int(upper_wick * 100)}% rejection wick & closed inside at ${c:,.1f}",
-                        },
-                    ))
-
-        # Sell-Side Liquidity (SSL / Low) pierced -> First-touch consumes pool
-        elif p["side"] == "SSL" and l < lvl:
-            state.mark_spent("spent_pools", pid)
-            pools_updated = True
-            if c > lvl and lower_wick >= 0.30 and c >= o:
-                if tf == "1H" and (macro_bias == "BEARISH" or allowed_1h == "SHORT_ONLY"):
-                    continue
-                sweep_depth = round(c - (l - 25.0), 1)
-                if 60.0 <= sweep_depth <= 380.0:
-                    candidates.append((
-                        tf_prio.get(tf, 1),
-                        {
-                            "name": f"BIG_SR_SWEEP [{tf}]",
-                            "action": "BUY_LONG",
-                            "tier": f"Tier-1 {tf} Liquidity Pool Sweep (First-Touch)",
-                            "entry": c,
-                            "wick_extreme": l,
-                            "invalidation_ref": round(l - 25.0, 1),
-                            "sweep_depth": sweep_depth,
-                            "wick_pct": int(lower_wick * 100),
-                            "swept_tf": tf,
-                            "swept_level": lvl,
-                            "why": f"Swept {p['why']} with {int(lower_wick * 100)}% absorption wick & closed inside at ${c:,.1f}",
-                        },
-                    ))
-
-    if pools_updated:
-        active_remaining = [p for p in pools if not state.is_spent("spent_pools", p["id"])]
-        state.set("htf_pools", active_remaining, ttl=86400)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
-
-
-# SETUP 2: TUNED_3SWING_INDUCEMENT_TRAP (w=4 Fractal + Trend/Big S/R + <=$160 + Spent Lock)
-def _find_5m_swings(df: pd.DataFrame, w: int = 4):
-    sh, sl = [], []
-    hh = df["h"].values
-    ll = df["l"].values
-    tt = df["time"].values
-    for idx in range(w, len(df) - w):
-        hv, lv = float(hh[idx]), float(ll[idx])
-        if hv >= np.max(hh[idx - w:idx]) and hv >= np.max(hh[idx + 1:idx + w + 1]):
-            sh.append({"idx": idx, "price": hv, "time": int(tt[idx])})
-        if lv <= np.min(ll[idx - w:idx]) and lv <= np.min(ll[idx + 1:idx + w + 1]):
-            sl.append({"idx": idx, "price": lv, "time": int(tt[idx])})
-    return sh, sl
-
-
-def check_tuned_3swing_inducement(df_5m: pd.DataFrame, state: BtcState, macro_bias: str):
-    if len(df_5m) < 35:
-        return None
-
-    i = len(df_5m) - 1
-    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
-    rng = max(h - l, 1.0)
-    upper_wick = (h - max(o, c)) / rng
-    lower_wick = (min(o, c) - l) / rng
-
-    pools = state.get("htf_pools") or []
-    near_big_sr_high = any(p["tf"] in ("4H", "1D", "1W") and p["side"] == "BSL" and abs(h - float(p["pivot"])) <= 150.0 for p in pools)
-    near_big_sr_low = any(p["tf"] in ("4H", "1D", "1W") and p["side"] == "SSL" and abs(l - float(p["pivot"])) <= 150.0 for p in pools)
-
-    sw_h, sw_l = _find_5m_swings(df_5m, w=4)
-
-    # Bearish Inducement Sweep (SELL_SHORT): Allowed in BEARISH macro bias OR near Big 4H/1D/1W BSL
-    if upper_wick >= 0.35 and c < o and (macro_bias == "BEARISH" or near_big_sr_high):
-        valid_sh = [s for s in sw_h if s["idx"] <= i - 6]
-        if len(valid_sh) >= 2:
-            rec = valid_sh[-6:]
-            for idx2 in range(len(rec) - 1, -1, -1):
-                s2 = rec[idx2]
-                sw_id = f"3SW_H_{int(s2['price'])}_{s2['time']}"
-                if state.is_spent("spent_3swing", sw_id):
-                    continue
-                if not (4 <= i - s2["idx"] <= 60) or not (h > s2["price"] and c < s2["price"]):
-                    continue
-                for idx1 in range(idx2 - 1, -1, -1):
-                    s1 = rec[idx1]
-                    if not (4 <= s2["idx"] - s1["idx"] <= 60):
-                        continue
-                    if s2["price"] < s1["price"] and h < (s1["price"] + 80.0):
-                        sweep_depth = max(60.0, round((h + 25.0) - c, 1))
-                        if sweep_depth <= 160.0:
-                            state.mark_spent("spent_3swing", sw_id)
-                            conf_note = "With 6H/4H Bearish Trend" if macro_bias == "BEARISH" else "At Big 4H/1D BSL Zone"
-                            return {
-                                "name": "TUNED_3SWING_INDUCEMENT_TRAP",
-                                "action": "SELL_SHORT",
-                                "tier": f"A+ SMC Inducement Sweep ({conf_note})",
-                                "entry": c,
-                                "wick_extreme": h,
-                                "invalidation_ref": round(h + 25.0, 1),
-                                "sweep_depth": sweep_depth,
-                                "wick_pct": int(upper_wick * 100),
-                                "swept_tf": "5M_SMC",
-                                "swept_level": s2["price"],
-                                "why": f"Swept Inducement High (${s2['price']:,.1f}) below Major High (${s1['price']:,.1f}) [{conf_note}]",
-                            }
-
-    # Bullish Inducement Sweep (BUY_LONG): Allowed in BULLISH macro bias OR near Big 4H/1D/1W SSL
-    if lower_wick >= 0.35 and c > o and (macro_bias == "BULLISH" or near_big_sr_low):
-        valid_sl = [s for s in sw_l if s["idx"] <= i - 6]
-        if len(valid_sl) >= 2:
-            rec = valid_sl[-6:]
-            for idx2 in range(len(rec) - 1, -1, -1):
-                s2 = rec[idx2]
-                sw_id = f"3SW_L_{int(s2['price'])}_{s2['time']}"
-                if state.is_spent("spent_3swing", sw_id):
-                    continue
-                if not (4 <= i - s2["idx"] <= 60) or not (l < s2["price"] and c > s2["price"]):
-                    continue
-                for idx1 in range(idx2 - 1, -1, -1):
-                    s1 = rec[idx1]
-                    if not (4 <= s2["idx"] - s1["idx"] <= 60):
-                        continue
-                    if s2["price"] > s1["price"] and l > (s1["price"] - 80.0):
-                        sweep_depth = max(60.0, round(c - (l - 25.0), 1))
-                        if sweep_depth <= 160.0:
-                            state.mark_spent("spent_3swing", sw_id)
-                            conf_note = "With 6H/4H Bullish Trend" if macro_bias == "BULLISH" else "At Big 4H/1D SSL Zone"
-                            return {
-                                "name": "TUNED_3SWING_INDUCEMENT_TRAP",
-                                "action": "BUY_LONG",
-                                "tier": f"A+ SMC Inducement Sweep ({conf_note})",
-                                "entry": c,
-                                "wick_extreme": l,
-                                "invalidation_ref": round(l - 25.0, 1),
-                                "sweep_depth": sweep_depth,
-                                "wick_pct": int(lower_wick * 100),
-                                "swept_tf": "5M_SMC",
-                                "swept_level": s2["price"],
-                                "why": f"Swept Inducement Low (${s2['price']:,.1f}) above Major Low (${s1['price']:,.1f}) [{conf_note}]",
-                            }
-
-    return None
-
-
-# SETUP 3: FRESH_30M_EQH_EQL_HUNT (Fresh <=30m Equal Highs/Lows Sweep)
-def check_fresh_30m_eqh_eql_hunt(df_5m: pd.DataFrame, state: BtcState, macro_bias: str):
-    if len(df_5m) < 12:
-        return None
-
-    i = len(df_5m) - 1
-    c, o, h, l = float(df_5m["c"].iloc[i]), float(df_5m["o"].iloc[i]), float(df_5m["h"].iloc[i]), float(df_5m["l"].iloc[i])
-    rng = max(h - l, 1.0)
-    upper_wick = (h - max(o, c)) / rng
-    lower_wick = (min(o, c) - l) / rng
-
-    win = df_5m.iloc[i - 6:i - 1]
-    win_h = win["h"].values.astype(float)
-    win_l = win["l"].values.astype(float)
-    prev_h = float(df_5m["h"].iloc[i - 1])
-    prev_l = float(df_5m["l"].iloc[i - 1])
-
-    pools = state.get("htf_pools") or []
-    near_big_sr_high = any(p["tf"] in ("4H", "1D", "1W") and p["side"] == "BSL" and abs(h - float(p["pivot"])) <= 150.0 for p in pools)
-    near_big_sr_low = any(p["tf"] in ("4H", "1D", "1W") and p["side"] == "SSL" and abs(l - float(p["pivot"])) <= 150.0 for p in pools)
-
-    piv_h = float(np.max(win_h))
-    piv_l = float(np.min(win_l))
-
-    # Fresh Equal Highs (EQH) Hunt -> SELL_SHORT
-    if prev_h <= piv_h and h > piv_h and c < piv_h and upper_wick >= 0.35 and c < o:
-        if (macro_bias == "RANGE" or near_big_sr_high) and np.sum(np.abs(win_h - piv_h) <= 30.0) >= 2:
-            sweep_depth = round((h + 25.0) - c, 1)
-            if 60.0 <= sweep_depth <= 250.0:
+        if b.get("flipped"):
+            if (action == "BUY_LONG" and regime != "TRENDING_BULL") or (action == "SELL_SHORT" and regime != "TRENDING_BEAR"):
+                continue
+            ok, ext, desc = _check_yellow_box_reclaim(m5, lvl, action, tol=ZONE_BUFFER_USD)
+            if ok:
+                state.mark_spent(zid)
                 return {
-                    "name": "FRESH_30M_EQH_EQL_HUNT",
-                    "action": "SELL_SHORT",
-                    "tier": "A+ Fresh <=30m Equal Highs (EQH) Sweep",
-                    "entry": c,
-                    "wick_extreme": h,
-                    "invalidation_ref": round(h + 25.0, 1),
-                    "sweep_depth": sweep_depth,
-                    "wick_pct": int(upper_wick * 100),
-                    "swept_tf": "30M_EQH",
-                    "swept_level": piv_h,
-                    "why": f"Swept Fresh <=30m Equal Highs (${piv_h:,.1f}) with {int(upper_wick * 100)}% rejection wick",
+                    "name": "BREAKOUT_FLIP_HUNT", "action": action, "zone_id": zid, "blue_box": lvl,
+                    "wick_extreme": round(ext, 2), "entry": ltp,
+                    "reason": f"Broken {b['tf']} Polarity Flip Retest — {desc}"
+                }
+        else:
+            is_major = (b.get("tf") in ("1D_BLUE_BOX", "4H_BLUE_BOX", "HIST_1D", "HIST_4H")) or (b.get("age_days", 0) >= 5) or (b.get("touches", 1) >= 2)
+            if not is_major and ((action == "SELL_SHORT" and regime == "TRENDING_BULL") or (action == "BUY_LONG" and regime == "TRENDING_BEAR")):
+                continue
+
+            ok, ext, desc = _check_yellow_box_reclaim(m5, lvl, action, tol=ZONE_BUFFER_USD)
+            if ok:
+                state.mark_spent(zid)
+                if (action == "SELL_SHORT" and big_up_in) or (action == "BUY_LONG" and big_dn_in):
+                    sname = "EXHAUSTION_TRAP_PT10"
+                elif b.get("touches", 1) >= 2:
+                    sname = "MULTI_TOUCH_SHELF"
+                elif b.get("source") == "CURRENT_DAY_DYNAMIC" or b.get("tf") in ("CURRENT_DAY_5M", "CURR_DAY"):
+                    sname = "CURRENT_DAY_DYNAMIC_ZONE"
+                else:
+                    sname = f"OLD_{b['tf']}" if b.get("age_days", 0) >= 5 else b["tf"]
+
+                return {
+                    "name": sname, "action": action, "zone_id": zid, "blue_box": lvl,
+                    "wick_extreme": round(ext, 2), "entry": ltp,
+                    "reason": f"{desc} | {b.get('why', '')} [Touches:{b.get('touches', 1)}, Age:{b.get('age_days', 0)}d]"
                 }
 
-    # Fresh Equal Lows (EQL) Hunt -> BUY_LONG
-    if prev_l >= piv_l and l < piv_l and c > piv_l and lower_wick >= 0.35 and c > o:
-        if (macro_bias == "RANGE" or near_big_sr_low) and np.sum(np.abs(win_l - piv_l) <= 30.0) >= 2:
-            sweep_depth = round(c - (l - 25.0), 1)
-            if 60.0 <= sweep_depth <= 250.0:
-                return {
-                    "name": "FRESH_30M_EQH_EQL_HUNT",
-                    "action": "BUY_LONG",
-                    "tier": "A+ Fresh <=30m Equal Lows (EQL) Sweep",
-                    "entry": c,
-                    "wick_extreme": l,
-                    "invalidation_ref": round(l - 25.0, 1),
-                    "sweep_depth": sweep_depth,
-                    "wick_pct": int(lower_wick * 100),
-                    "swept_tf": "30M_EQL",
-                    "swept_level": piv_l,
-                    "why": f"Swept Fresh <=30m Equal Lows (${piv_l:,.1f}) with {int(lower_wick * 100)}% absorption wick",
-                }
+    # 2. 15M Trend Pullback Liquidity Hunt (Gold's +32.5R Proven Trend Engine — evaluated on closed 15M candle)
+    if m15 is not None and len(m15) >= 16:
+        last_15m_t = int(m15["time"].iloc[-1])
+        if state.get("last_eval_15m") != last_15m_t:
+            state.set("last_eval_15m", last_15m_t, ttl=1200)
+            sc15 = _median_range(m15, 20)
+            hh15, ll15 = m15["h"].values, m15["l"].values
+            k = len(m15) - 1
+            o15, h15, l15, c15 = float(m15["o"].iloc[k]), float(hh15[k]), float(ll15[k]), float(m15["c"].iloc[k])
+            rng15 = max(h15 - l15, 0.05)
+            up_w15, dn_w15 = (h15 - max(o15, c15)) / rng15, (min(o15, c15) - l15) / rng15
+
+            if regime == "TRENDING_BULL":
+                pb_idx = k - 6 + int(np.argmin(ll15[k - 6 : k - 1]))
+                pb_low = float(ll15[pb_idx])
+                imp_h = float(np.max(hh15[max(0, pb_idx - 8) : pb_idx]))
+                if (imp_h - pb_low) >= 1.2 * sc15 and pb_low > float(np.min(ll15[max(0, pb_idx - 12) : pb_idx])):
+                    if l15 < pb_low and c15 > pb_low and c15 > o15 and (dn_w15 >= 0.25 or (c15 - o15) >= 0.4 * sc15):
+                        return {
+                            "name": "TREND_PULLBACK_LIQ_HUNT", "action": "BUY_LONG", "zone_id": f"G15_PB_L_{last_15m_t}",
+                            "blue_box": pb_low, "wick_extreme": round(l15, 2), "entry": c15,
+                            "reason": f"15M Bullish Impulse Pullback Sweep below ${pb_low:.2f} (Wick ${l15:.2f}) & Green Reclaim (${c15:.2f})"
+                        }
+            elif regime == "TRENDING_BEAR":
+                pb_idx = k - 6 + int(np.argmax(hh15[k - 6 : k - 1]))
+                pb_high = float(hh15[pb_idx])
+                imp_l = float(np.min(ll15[max(0, pb_idx - 8) : pb_idx]))
+                if (pb_high - imp_l) >= 1.2 * sc15 and pb_high < float(np.max(hh15[max(0, pb_idx - 12) : pb_idx])):
+                    if h15 > pb_high and c15 < pb_high and c15 < o15 and (up_w15 >= 0.25 or (o15 - c15) >= 0.4 * sc15):
+                        return {
+                            "name": "TREND_PULLBACK_LIQ_HUNT", "action": "SELL_SHORT", "zone_id": f"G15_PB_H_{last_15m_t}",
+                            "blue_box": pb_high, "wick_extreme": round(h15, 2), "entry": c15,
+                            "reason": f"15M Bearish Impulse Pullback Sweep above ${pb_high:.2f} (Wick ${h15:.2f}) & Red Reclaim (${c15:.2f})"
+                        }
+
+    # 3. Dual-Side Liquidity Hunt (Point #7 & #8)
+    if len(m5) >= 20:
+        bh = float(m5["h"].iloc[-18:-5].max())
+        bl = float(m5["l"].iloc[-18:-5].min())
+        if 3.5 <= (bh - bl) <= 12.0:
+            mid_h = float(m5["h"].iloc[-5:-1].max())
+            mid_l = float(m5["l"].iloc[-5:-1].min())
+            if mid_h > bh and mid_l >= bl and regime != "TRENDING_BEAR":
+                ok, ext, desc = _check_yellow_box_reclaim(m5, bl, "BUY_LONG", tol=ZONE_BUFFER_USD)
+                if ok:
+                    return {
+                        "name": "DUAL_SIDE_HUNT_PT7", "action": "BUY_LONG", "zone_id": f"GDUAL_L_{int(bl*100)}",
+                        "blue_box": bl, "wick_extreme": round(ext, 2), "entry": ltp,
+                        "reason": f"Dual-Side Hunt: Swept High (${bh:.2f}) first, then Low (${bl:.2f}) -> {desc}"
+                    }
+            elif mid_l < bl and mid_h <= bh and regime != "TRENDING_BULL":
+                ok, ext, desc = _check_yellow_box_reclaim(m5, bh, "SELL_SHORT", tol=ZONE_BUFFER_USD)
+                if ok:
+                    return {
+                        "name": "DUAL_SIDE_HUNT_PT7", "action": "SELL_SHORT", "zone_id": f"GDUAL_H_{int(bh*100)}",
+                        "blue_box": bh, "wick_extreme": round(ext, 2), "entry": ltp,
+                        "reason": f"Dual-Side Hunt: Swept Low (${bl:.2f}) first, then High (${bh:.2f}) -> {desc}"
+                    }
 
     return None
 
 
 # ==============================================================================
-# TIER-2 FAST 5M GATEKEEPER + PARALLEL BACKGROUND HYDROGEN CONFIRMATION
+# PARALLEL NON-BLOCKING BACKGROUND AI CONFIRMATION
 # ==============================================================================
-ENTRY_GATEKEEPER_SYS_PROMPT = (
-    "You are a fast Institutional BTCUSD Liquidity Execution Gatekeeper.\n"
-    "Python detected a 5M liquidity sweep setup. Approve ONLY clean sweeps aligned with market structure.\n"
-    "RULES:\n"
-    "1. For BIG_SR_SWEEP [1H] or TUNED_3SWING_INDUCEMENT_TRAP: Direction must align with Macro Bias unless sweeping a major 4H/1D/1W S/R zone.\n"
-    "2. For BIG_SR_SWEEP [4H/1D/1W] or FRESH_30M_EQH_EQL_HUNT: Approve if sweep wick >= 30% and body closed cleanly back inside.\n"
-    "3. Reject if entry is running directly into an opposing 4H/1D liquidity wall less than $150 away.\n"
-    "Respond ONLY in strict JSON:\n"
-    '{"approved": true/false, "confidence": "HIGH|MEDIUM|REJECT", "view": "1 crisp sentence"}'
-)
-
-HYDROGEN_CONFIRM_SYS_PROMPT = (
-    "You are the Senior Institutional BTCUSD Chief Strategist (gemini-4-hydrogen).\n"
-    "An intraday 5M liquidity sweep entry alert was just triggered. Perform a deep secondary liquidity and order-flow audit.\n"
-    "Respond ONLY in strict JSON:\n"
-    '{"verdict": "CONFIRMED|CAUTION|INVALIDATE_WARNING", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 crisp sentences for manual trade management"}'
+LIVE_CONFIRM_SYS_PROMPT = (
+    "You are the Gold (XAUTUSD) Institutional Pure Liquidity Supervisor (Zero Indicators).\n"
+    "Python already fired a fast Yellow Box sweep alert. Perform an independent price-action audit.\n"
+    "Decode delta candles using Base Price. Check wick quality, zone authenticity, and opposing walls.\n"
+    "Respond ONLY in strictly valid JSON:\n"
+    '{"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 concise sentences"}'
 )
 
 
-def _background_hydrogen_entry_audit(setup: dict, usr_p: str, fired_time_str: str):
-    """Non-blocking background worker calling gemini-4-hydrogen (with heavy fallback) after entry alert fires."""
-    ai_res, provider = call_ai_chain(HEAVY_AI_CHAIN, HYDROGEN_CONFIRM_SYS_PROMPT, usr_p, max_tokens=400)
+def _background_ai_confirm_worker(setup: dict, usr_p: str, signal_time: str):
+    ai_res, provider = call_gemini_chain(LIVE_CONFIRM_CHAIN, LIVE_CONFIRM_SYS_PROMPT, usr_p)
     if not ai_res:
-        log.warning(f"[BTC] Background heavy confirmation unreachable ({provider})")
+        log.warning(f"[GOLD] Background AI confirm unreachable ({provider})")
         return
-
-    verdict = ai_res.get("verdict", "CONFIRMED")
+    verdict = ai_res.get("verdict", "APPROVED")
     conf = ai_res.get("confidence", "MEDIUM")
-    note = ai_res.get("note", "Secondary liquidity audit completed.")
-    badge = "✅" if verdict == "CONFIRMED" else ("⚠️" if verdict == "CAUTION" else "🚨")
-    action_title = "BUY (LONG)" if setup["action"] == "BUY_LONG" else "SELL (SHORT)"
-
-    msg = f"""{badge} <b>[HEAVY AI CONFIRMATION] {action_title} @ ${setup['entry']:,.1f}</b>
-⏱️ <b>Signal Time:</b> <code>{fired_time_str}</code> | <b>Setup:</b> <code>{esc(setup['name'])}</code>
-🧠 <b>Model      :</b> <code>{esc(provider)}</code>
-🏛️ <b>Verdict    :</b> <b>[{esc(verdict)} | {esc(conf)}]</b>
-<i>{esc(note)}</i>"""
-
-    tg_send(msg)
-    log.info(f"[BTC] 🧠 Background Heavy Confirmation sent ({provider}: {verdict})")
-
-
-# ==============================================================================
-# DIAGNOSTIC STARTUP CHECK & DAILY HEALTH REPORT
-# ==============================================================================
-def run_startup_diagnostics(state: BtcState):
-    log.info("[BTC] 🔍 Running Startup Diagnostic Suite (V9.5)...")
-    now = datetime.now(IST)
-
-    t0 = time.time()
-    df_test = fetch_delta_candles(BTC_SYMBOL, "5m", hours_back=3, closed_only=False)
-    delta_lat = int((time.time() - t0) * 1000)
-    delta_status = "ONLINE" if not df_test.empty else "OFFLINE"
-    ltp_test = float(df_test.iloc[-1]["c"]) if not df_test.empty else 0.0
-
-    t0 = time.time()
-    ai_test_res, ai_provider = call_ai_chain(
-        FAST_5M_AI_CHAIN,
-        'Respond strictly in JSON: {"status":"ok"}',
-        "Diagnostic ping. Return status ok.",
-        max_tokens=100,
+    note = ai_res.get("note", "")
+    badge = "✅" if verdict == "APPROVED" else ("⚠️" if verdict == "WAIT_CAUTION" else "🛑")
+    tg_send(
+        f"{badge} <b>[GOLD AI CONFIRMATION | {signal_time}]</b>\n"
+        f"⚡ <b>Setup:</b> <code>{esc(setup['name'])}</code> ({esc(setup['action'])}) @ <b>${setup['entry']:.2f}</b>\n"
+        f"🧠 <b>Model:</b> <code>{esc(provider)}</code> | <b>Verdict:</b> <b>[{esc(verdict)} | {esc(conf)}]</b>\n"
+        f"<i>{esc(note)}</i>"
     )
-    ai_lat = int((time.time() - t0) * 1000)
-    ai_status = f"ONLINE ({ai_lat}ms)" if ai_test_res else "OFFLINE / UNREACHABLE"
-
-    # Trigger initial background HTF liquidity pool sync so pools are ready immediately
-    trigger_macro_sync_if_due(state.store, force=True)
-
-    startup_msg = f"""🚀 <b>[BTC INSTITUTIONAL LIQUIDITY ENGINE V9.5 ONLINE]</b>
-📅 <b>Time:</b> <code>{now.strftime('%Y-%m-%d %H:%M:%S IST')}</code> | <b>Server:</b> <code>Koyeb</code>
-
-🟢 <b>Delta Public API :</b> <code>{delta_status} (LTP: ${ltp_test:,.1f} | {delta_lat}ms)</code>
-🟢 <b>5M Gatekeeper AI :</b> <code>{ai_status} [{esc(ai_provider)}]</code>
-🟢 <b>Heavy Confirm AI :</b> <code>{esc(HYDROGEN_MODEL)} -> {esc(FLASH_38_MODEL)} -> {esc(FLASH_36_MODEL)}</code>
-🟢 <b>HTTP Health Check:</b> <code>RUNNING (Port {PORT} - UptimeRobot Ready)</code>
-
-🎯 <b>Active Pure Formal Liquidity Setups (Entry-Only Mode):</b>
-- <code>BIG_SR_SWEEP [1W, 1D, 4H, 1H]</code> (First-Touch Pool Sweep)
-- <code>TUNED_3SWING_INDUCEMENT_TRAP</code> (w=4 Fractal + Trend/Big S/R + &lt;=$160)
-- <code>FRESH_30M_EQH_EQL_HUNT</code> (Fresh &lt;=30m Equal Highs/Lows Sweep)
-
-🛡️ <i>Spent Zone Lock + 60m Opposite-Direction Lock + Background Hydrogen Audit Active.</i>"""
-
-    tg_send(startup_msg)
-    log.info("[BTC] ✅ Startup diagnostics complete.")
 
 
-def check_daily_0915_health_report(state: BtcState, ltp: float):
-    global _last_daily_report_date
-    now = datetime.now(IST)
-    today_str = now.strftime("%Y-%m-%d")
-
-    if now.hour == 9 and now.minute >= 15 and _last_daily_report_date != today_str:
-        _last_daily_report_date = today_str
-        snap = state.get("macro_snapshot") or {}
-        pools = state.get("htf_pools") or []
-        bias = state.get("macro_bias", snap.get("struct_bias", "N/A"))
-
-        daily_msg = f"""☀️ <b>[DAILY 09:15 AM BTC LIQUIDITY HEALTH AUDIT]</b>
-📅 <code>{now.strftime('%d %b %Y | %H:%M IST')}</code>
-
-📊 <b>Engine Status:</b>
-- AI Calls Today   : <code>{_daily_ai_call_count} Calls</code>
-- Active HTF Pools : <code>{len(pools)} Un-swept (BSL:{snap.get('bsl_count', 0)} | SSL:{snap.get('ssl_count', 0)})</code>
-- Macro Bias       : <b>{esc(bias)}</b> (6H: {esc(snap.get('t6', 'N/A'))} | 4H: {esc(snap.get('t4', 'N/A'))})
-- BTC LTP          : <b>${ltp:,.1f}</b>
-
-✅ <i>Entry-Only Pure Liquidity Engine V9.5 active (Manual SL/TP mode).</i>"""
-        tg_send(daily_msg)
+def run_startup_diagnostics(shared_store=None) -> dict:
+    log.info("[GOLD] Running Startup Diagnostics...")
+    t0 = time.time()
+    df_t = fetch_delta_candles("5m", hours_back=3, closed_only=False)
+    api_ms = int((time.time() - t0) * 1000)
+    ok = not df_t.empty
+    ltp = float(df_t["c"].iloc[-1]) if ok else 0.0
+    if ok:
+        trigger_6h_macro_if_due(shared_store, force=True)
+    return {"asset": "GOLD", "api_ok": ok, "api_ms": api_ms, "ltp": ltp}
 
 
 # ==============================================================================
-# MAIN 5M EXECUTION CYCLE (ENTRY-ONLY IDENTIFICATION)
+# MAIN 5M CYCLE (PYTHON-FIRST INSTANT ALERT -> PARALLEL AI)
 # ==============================================================================
-def run_btc_cycle(shared_store=None):
-    if not _btc_lock.acquire(blocking=False):
-        log.warning("[BTC] Execution lock busy, skipping cycle")
+def run_gold_cycle(shared_store=None):
+    if not _gold_lock.acquire(blocking=False):
         return
-
     try:
-        state = BtcState(shared_store)
-        state.set("last_tick", time.time(), ttl=86400)
+        state = GoldState(shared_store)
 
-        # Check scheduled 23:30 IST 1D+4H+1H job & 3x Intraday 4H-1H sync (05:30, 11:30, 17:30 IST)
-        trigger_macro_sync_if_due(shared_store, force=False)
+        # 1. Check 23:30 BIG Analysis & Every 6-Hour Sync (05:30, 11:30, 17:30 IST)
+        trigger_6h_macro_if_due(shared_store, force=False)
 
-        # Fetch closed 5M candles for execution
-        df_5m = fetch_delta_candles(BTC_SYMBOL, "5m", hours_back=24, closed_only=True)
-        if df_5m.empty or len(df_5m) < 40:
-            log.warning("[BTC] Insufficient 5M candle data from Delta Exchange")
+        # 2. Fetch closed 5M candles
+        df_5m = fetch_delta_candles("5m", hours_back=36, closed_only=True)
+        if df_5m.empty or len(df_5m) < 30:
             return
+
+        last_bar_t = int(df_5m["time"].iloc[-1])
+        if state.get("last_eval_5m") == last_bar_t:
+            return
+        state.set("last_eval_5m", last_bar_t, ttl=300)
 
         ltp = float(df_5m["c"].iloc[-1])
-        last_bar_time = int(df_5m["time"].iloc[-1])
+        close_ts = _ensure_ist(df_5m["ts"].iloc[-1]) + timedelta(minutes=5)
+        df_15m = fetch_delta_candles("15m", hours_back=48, closed_only=True)
 
-        check_daily_0915_health_report(state, ltp)
+        regime = state.get("regime") or "SIDEWAYS"
+        zones = state.get("active_zones")
+        if zones is None:
+            df_1h = fetch_delta_candles("1h", hours_back=24 * 7, closed_only=True)
+            df_4h = fetch_delta_candles("4h", hours_back=24 * 15, closed_only=True)
+            regime = get_pure_pa_regime(df_4h, df_1h)
+            zones = extract_pure_blue_boxes(None, df_4h, df_1h, df_5m, ltp, close_ts, state)
+            state.set("regime", regime, ttl=14400)
+            state.set("active_zones", zones, ttl=21600)
 
-        # Evaluate each closed 5M candle strictly once
-        if state.get("last_evaluated_5m_ts") == last_bar_time:
-            return
-        state.set("last_evaluated_5m_ts", last_bar_time, ttl=300)
+        # 3. Check Zone Vacuum (< 2 zones in LTP ± $100) -> Dynamic 3-Yr Band Slice / New High Fallback
+        check_zone_vacuum_and_trigger_band(state, zones, ltp, df_5m)
 
-        # Ensure HTF pools exist if container just booted without startup hook
-        if state.get("htf_pools") is None:
-            trigger_macro_sync_if_due(shared_store, force=True)
-
-        snap = state.get("macro_snapshot") or {}
-        macro_bias = state.get("macro_bias", snap.get("struct_bias", "RANGE"))
-        allowed_1h = state.get("allowed_1h_sweep", "BOTH")
-        closed_ts_str = df_5m["ts"].iloc[-1].strftime("%H:%M IST")
-
-        log.info(f"[BTC] ═════════ 5M LIQUIDITY AUDIT: {closed_ts_str} ═════════")
-        log.info(f"[BTC] Close: ${ltp:,.1f} | Macro Bias: {macro_bias} (1H Rule: {allowed_1h}) | AI Calls: {_daily_ai_call_count}")
-
-        # Evaluate the 3 Validated Pure Formal Liquidity Setups
-        setup = (
-            check_big_sr_and_1h_sweep(df_5m, state, macro_bias, allowed_1h)
-            or check_tuned_3swing_inducement(df_5m, state, macro_bias)
-            or check_fresh_30m_eqh_eql_hunt(df_5m, state, macro_bias)
-        )
-
+        # 4. Evaluate Pure Liquidity Setups (0-Lag Python)
+        setup = detect_gold_pure_liquidity_setup(df_5m, df_15m, zones, regime, state)
         if not setup:
-            log.info("[BTC] Setups Evaluated: BIG_SR_1W_1D_4H_1H=NO | 3SWING_TRAP=NO | 30M_EQH_EQL=NO -> WAITING")
+            log.info(f"[GOLD] {close_ts.strftime('%H:%M IST')} | LTP:${ltp:.2f} | Regime:{regime} | Zones:{len(zones)} -> WAITING")
             return
 
-        # 60-Minute Global Opposite-Direction Lock (Prevents flip-flop collisions)
-        last_dir = state.get("last_signal_dir")
-        last_dir_ts = state.get("last_signal_ts") or 0
-        if last_dir and last_dir != setup["action"] and (time.time() - last_dir_ts) < (OPPOSITE_LOCK_MIN * 60):
-            rem_opp = int(((OPPOSITE_LOCK_MIN * 60) - (time.time() - last_dir_ts)) / 60)
-            log.info(f"[BTC] Opposite-direction lock active ({last_dir} fired recently; {rem_opp}m left). Blocked {setup['action']}.")
+        last_dir = state.get("last_sig_dir")
+        last_dir_t = state.get("last_sig_ts") or 0
+        if last_dir and last_dir != setup["action"] and (time.time() - last_dir_t) < OPPOSITE_LOCK_MIN * 60:
             return
 
-        # 90-Minute Same-Setup Cooldown
         cd_key = f"cd_{setup['name']}_{setup['action']}"
-        cd_until = state.get(cd_key)
-        if cd_until and time.time() < cd_until:
-            rem_m = int((cd_until - time.time()) / 60)
-            log.info(f"[BTC] Cooldown active for {setup['name']} ({rem_m}m remaining). Skipped.")
+        if state.get(cd_key):
             return
 
-        # Build rich liquidity context for Tier-2 Gatekeeper & Tier-1 Background Hydrogen Audit
-        bsl_str = ", ".join([z["why"] for z in snap.get("nearest_bsl", [])[:2]]) or "None"
-        ssl_str = ", ".join([z["why"] for z in snap.get("nearest_ssl", [])[:2]]) or "None"
-        usr_p = (
-            f"Asset: BTCUSD | Closed 5M Bar: {closed_ts_str} | Entry Close: ${setup['entry']:,.1f}\n"
-            f"6H/4H Macro Bias: {macro_bias} (Allowed 1H Sweep: {allowed_1h})\n"
-            f"Detected Setup: {setup['name']} ({setup['tier']})\n"
-            f"Action: {setup['action']} | Sweep Wick Extreme: ${setup['wick_extreme']:,.1f} | Sweep Depth: ${setup['sweep_depth']:.1f}\n"
-            f"Trigger Details: {setup['why']}\n"
-            f"EQH/EQL Counter: BSL Above={snap.get('bsl_count', 0)} (EQH:{snap.get('eqh_count', 0)}) | SSL Below={snap.get('ssl_count', 0)} (EQL:{snap.get('eql_count', 0)})\n"
-            f"Nearest BSL: {bsl_str} | Nearest SSL: {ssl_str}"
-        )
+        state.set("last_sig_dir", setup["action"], ttl=OPPOSITE_LOCK_MIN * 60)
+        state.set("last_sig_ts", time.time(), ttl=OPPOSITE_LOCK_MIN * 60)
+        state.set(cd_key, True, ttl=SETUP_COOLDOWN_MIN * 60)
 
-        log.info(f"[BTC] ⚡ Calling Tier-2 Fast Gatekeeper for {setup['name']} ({setup['action']})...")
-        ai_res, provider = call_ai_chain(FAST_5M_AI_CHAIN, ENTRY_GATEKEEPER_SYS_PROMPT, usr_p, max_tokens=300)
-
-        if not ai_res or not ai_res.get("approved", False):
-            reason = ai_res.get("view", "Rejected by Gatekeeper") if ai_res else f"AI Unreachable ({provider})"
-            log.warning(f"[BTC] 🛑 Entry Blocked by Gatekeeper: {reason}")
-            state.set(cd_key, time.time() + WAIT_COOLDOWN_MIN * 60, ttl=WAIT_COOLDOWN_MIN * 60)
-            return
-
-        # Lock direction & setup cooldown
-        state.set("last_signal_dir", setup["action"], ttl=OPPOSITE_LOCK_MIN * 60)
-        state.set("last_signal_ts", time.time(), ttl=OPPOSITE_LOCK_MIN * 60)
-        state.set(cd_key, time.time() + (SETUP_COOLDOWN_MIN * 60), ttl=SETUP_COOLDOWN_MIN * 60)
-
+        # 5. PYTHON-FIRST INSTANT TELEGRAM ALERT (Entry-Only, Manual SL/Target)
         em = "🟢" if setup["action"] == "BUY_LONG" else "🔴"
-        action_title = "BUY (LONG)" if setup["action"] == "BUY_LONG" else "SELL (SHORT)"
-        ai_view = ai_res.get("view", "Clean institutional liquidity sweep confirmed.")
-        ai_conf = ai_res.get("confidence", "HIGH")
-        now_str = datetime.now(IST).strftime("%H:%M IST")
-
-        msg = f"""{em} <b>[BITCOIN - BTCUSD] {action_title} | {now_str}</b>
-
-⚡ <b>Setup        :</b> <code>{esc(setup['name'])}</code>
-🏆 <b>Category     :</b> {esc(setup['tier'])}
-🎯 <b>Entry Price  :</b> <b>${setup['entry']:,.1f}</b>
-🛑 <b>Wick Extreme :</b> <b>${setup['wick_extreme']:,.1f}</b> <i>(Invalidation Ref: ${setup['invalidation_ref']:,.1f} | Depth: ${setup['sweep_depth']:.1f})</i>
-
-🧭 <b>Macro Bias   :</b> <b>{esc(macro_bias)}</b> <i>(6H: {esc(snap.get('t6', 'N/A'))} | 4H: {esc(snap.get('t4', 'N/A'))})</i>
-💧 <b>EQH/EQL Pool :</b> <code>BSL Above: {snap.get('bsl_count', 0)} (EQH:{snap.get('eqh_count', 0)}) | SSL Below: {snap.get('ssl_count', 0)} (EQL:{snap.get('eql_count', 0)})</code>
-📝 <b>Sweep Logic  :</b> {esc(setup['why'])}
-⚡ <b>Gatekeeper ({esc(provider)}):</b> [{esc(ai_conf)}] <i>{esc(ai_view)}</i>
-
-⏳ <i>Running {esc(HYDROGEN_MODEL)} background confirmation... (Manual SL &amp; Target Mode)</i>"""
-
-        tg_send(msg)
-        log.info(f"[BTC] 🔥 ENTRY ALERT FIRED: {setup['name']} ({setup['action']}) @ ${setup['entry']:,.1f}")
-
-        # Launch non-blocking background thread for gemini-4-hydrogen confirmation
-        t_hydro = threading.Thread(
-            target=_background_hydrogen_entry_audit,
-            args=(setup, usr_p, now_str),
-            daemon=True,
+        title_act = "BUY (LONG)" if setup["action"] == "BUY_LONG" else "SELL (SHORT)"
+        sig_time_str = close_ts.strftime("%H:%M IST")
+        msg = (
+            f"{em} <b>[GOLD - XAUTUSD] {title_act} | {sig_time_str}</b>\n\n"
+            f"⚡ <b>Setup        :</b> <code>{esc(setup['name'])}</code>\n"
+            f"🎯 <b>Entry Price  :</b> <b>${setup['entry']:.2f}</b>\n"
+            f"🟦 <b>Blue Box Lvl :</b> <b>${setup['blue_box']:.2f}</b> | <b>Yellow Wick Ext:</b> <b>${setup['wick_extreme']:.2f}</b>\n"
+            f"🧭 <b>PA Regime    :</b> <code>{esc(regime)}</code>\n"
+            f"📝 <b>Sweep Logic  :</b> {esc(setup['reason'])}\n\n"
+            f"⏳ <i>Chart baghun manual confirm kar (Manual SL &amp; Target mode). Running parallel AI audit...</i>"
         )
-        t_hydro.start()
+        tg_send(msg)
+        log.info(f"[GOLD] 🔥 INSTANT ALERT: {setup['name']} ({setup['action']}) @ ${setup['entry']:.2f}")
+
+        # 6. Parallel Non-Blocking Background AI Audit
+        base_p = round(math.floor(ltp / 50.0) * 50.0, 2)
+        delta_bars = encode_delta_candles(df_5m, 45, base_p, "%m-%d %H:%M")
+        usr_p = (
+            f"Asset: GOLD (XAUTUSD) | Time: {sig_time_str} | Entry: ${setup['entry']:.2f}\n"
+            f"Setup: {setup['name']} ({setup['action']}) | Blue Box: ${setup['blue_box']:.2f} | Wick Ext: ${setup['wick_extreme']:.2f}\n"
+            f"Regime: {regime} | Reason: {setup['reason']}\n"
+            f"Base Price: ${base_p} | Recent 45 5M Delta Candles: {delta_bars}"
+        )
+        threading.Thread(
+            target=_background_ai_confirm_worker,
+            args=(setup, usr_p, sig_time_str),
+            daemon=True,
+        ).start()
 
     except Exception as e:
-        log.exception(f"[BTC] Error in run_btc_cycle: {type(e).__name__}")
+        log.exception(f"[GOLD] Cycle error: {type(e).__name__}")
     finally:
         try:
-            _btc_lock.release()
+            _gold_lock.release()
         except RuntimeError:
             pass
-
-
-def run_6h_analysis(shared_store=None):
-    """Orchestrator hook for 6-hour macro sync (uses shared slot lock so zero duplicate alerts)."""
-    trigger_macro_sync_if_due(shared_store, force=False)
-
-
-def run_btc_30m_tick(shared_store=None):
-    run_btc_cycle(shared_store)
-
-
-def run_btc_1m_tick(shared_store=None):
-    run_btc_cycle(shared_store)
-
-
-if __name__ == "__main__":
-    log.info("[BTC] Starting Bitcoin Institutional Liquidity Engine v9.5 on Koyeb...")
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-
-    state_init = BtcState()
-    run_startup_diagnostics(state_init)
-
-    log.info("[BTC] Starting 30-Second Continuous Polling Loop...")
-    while True:
-        try:
-            run_btc_cycle()
-        except Exception as e:
-            log.error(f"[BTC] Loop iteration error: {type(e).__name__}")
-        time.sleep(30)
