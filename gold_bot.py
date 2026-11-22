@@ -413,7 +413,7 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.
         if len(df_today) >= 8:
             sc5 = _median_range(df_today, 15)
             hh5, ll5, cc5 = df_today["h"].values, df_today["l"].values, df_today["c"].values
-            for k in range(3, len(df_today) - 2):
+            for k in range(3, len(df_today) - 3):
                 ft = _ensure_ist(df_today["ts"].iloc[k])
                 if hh5[k] == np.max(hh5[k - 3 : k + 3]) and (hh5[k] - np.min(ll5[k + 1 : k + 3])) >= 1.2 * sc5:
                     if len(hh5[k + 3 : -1]) == 0 or (np.max(hh5[k + 3 : -1]) <= hh5[k] and np.max(cc5[k + 3 : -1]) <= hh5[k]):
@@ -444,7 +444,8 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.
     for cand in raw_boxes:
         m = next((x for x in merged if x["type"] == cand["type"] and not x.get("flipped") and abs(float(x["pivot"]) - float(cand["pivot"])) <= SHELF_MERGE_USD), None)
         if m:
-            m["touches"] = m.get("touches", 1) + 1
+            if not str(m.get("source", "")).startswith("AI_") and not str(cand.get("source", "")).startswith("AI_"):
+                m["touches"] = m.get("touches", 1) + 1
             m["age_days"] = max(m.get("age_days", 0), cand.get("age_days", 0))
             m["pivot"] = round(max(float(m["pivot"]), float(cand["pivot"])) if cand["type"] == "RESISTANCE" else min(float(m["pivot"]), float(cand["pivot"])), 2)
         else:
@@ -474,7 +475,7 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, df_5m: pd.DataFr
     low_b, high_b = round(ltp - DEEP_BAND_USD, 2), round(ltp + DEEP_BAND_USD, 2)
 
     df_1d_3y = fetch_delta_candles("1d", hours_back=24 * 1095, closed_only=True)
-    df_4h_11m = fetch_delta_candles("4h", hours_back=24 * 330, closed_only=True)
+    df_4h_11m = fetch_delta_candles("4h", hours_back=24 * 300, closed_only=True)
 
     hist_hits = []
     for df_h, lbl in [(df_1d_3y, "1D"), (df_4h_11m, "4H")]:
@@ -517,7 +518,7 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, df_5m: pd.DataFr
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
                 continue
-            zid = f"AI_BAND_{ztype[:3]}_{int(piv*100)}_{now.strftime('%H%M')}_{idx}"
+            zid = f"AI_BAND_{ztype[:3]}_{int(piv*100)}_{now.strftime('%Y%m%d')}"
             item = {
                 "id": zid, "type": ztype, "tf": str(z.get("tf", "HIST_1D")), "prio": 2,
                 "pivot": piv, "age_days": 30, "touches": 1, "flipped": False,
@@ -530,6 +531,8 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, df_5m: pd.DataFr
 
     if added:
         state.set("ai_zones", existing_ai[-30:], ttl=86400)
+        cur_active = state.get("active_zones") or []
+        state.set("active_zones", (added + cur_active)[:25], ttl=86400)
         lines = [f"• <b>{z['type']}</b> @ <code>${z['pivot']:.2f}</code> ({esc(z['why'])})" for z in added[:5]]
         tg_send(
             f"🧭 <b>[GOLD DEEP BAND SYNC | {esc(provider)}]</b>\n"
@@ -625,7 +628,7 @@ def _execute_6h_macro_worker(shared_store, is_daily_2330: bool):
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
                 continue
-            zid = f"AI_6H_{ztype[:3]}_{int(piv*100)}_{now.strftime('%Y%m%d_%H')}_{idx}"
+            zid = f"AI_6H_{ztype[:3]}_{int(piv*100)}_{now.strftime('%Y%m%d')}"
             ai_saved.append({
                 "id": zid, "type": ztype, "tf": str(z.get("tf", "CURR_DAY")), "prio": 2,
                 "pivot": piv, "age_days": 0, "touches": 1, "flipped": False,
@@ -903,14 +906,18 @@ def run_gold_cycle(shared_store=None):
         df_15m = fetch_delta_candles("15m", hours_back=48, closed_only=True)
 
         regime = state.get("regime") or "SIDEWAYS"
-        zones = state.get("active_zones")
-        if zones is None:
-            df_1h = fetch_delta_candles("1h", hours_back=24 * 7, closed_only=True)
-            df_4h = fetch_delta_candles("4h", hours_back=24 * 15, closed_only=True)
+        cached_htf = state.get("active_zones") or []
+        df_1h = fetch_delta_candles("1h", hours_back=24 * 7, closed_only=True)
+        df_4h = fetch_delta_candles("4h", hours_back=24 * 15, closed_only=True)
+        if not state.get("regime"):
             regime = get_pure_pa_regime(df_4h, df_1h)
-            zones = extract_pure_blue_boxes(None, df_4h, df_1h, df_5m, ltp, close_ts, state)
             state.set("regime", regime, ttl=14400)
-            state.set("active_zones", zones, ttl=21600)
+        live_zones = extract_pure_blue_boxes(None, df_4h, df_1h, df_5m, ltp, close_ts, state)
+        zones = list(live_zones)
+        for cz in cached_htf:
+            if not state.is_spent(cz["id"]) and not any(x["type"] == cz["type"] and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_USD for x in zones):
+                zones.append(cz)
+        state.set("active_zones", zones[:25], ttl=21600)
 
         # 3. Check Zone Vacuum (< 2 zones in LTP ± $100) -> Dynamic 3-Yr Band Slice / New High Fallback
         check_zone_vacuum_and_trigger_band(state, zones, ltp, df_5m)
@@ -950,14 +957,17 @@ def run_gold_cycle(shared_store=None):
         tg_send(msg)
         log.info(f"[GOLD] 🔥 INSTANT ALERT: {setup['name']} ({setup['action']}) @ ${setup['entry']:.2f}")
 
-        # 6. Parallel Non-Blocking Background AI Audit
+        # 6. Parallel Non-Blocking Background AI Audit (includes 15M + 5M delta candles)
         base_p = round(math.floor(ltp / 50.0) * 50.0, 2)
-        delta_bars = encode_delta_candles(df_5m, 45, base_p, "%m-%d %H:%M")
+        delta_5m = encode_delta_candles(df_5m, 40, base_p, "%m-%d %H:%M")
+        delta_15m = encode_delta_candles(df_15m, 20, base_p, "%m-%d %H:%M")
         usr_p = (
             f"Asset: GOLD (XAUTUSD) | Time: {sig_time_str} | Entry: ${setup['entry']:.2f}\n"
             f"Setup: {setup['name']} ({setup['action']}) | Blue Box: ${setup['blue_box']:.2f} | Wick Ext: ${setup['wick_extreme']:.2f}\n"
             f"Regime: {regime} | Reason: {setup['reason']}\n"
-            f"Base Price: ${base_p} | Recent 45 5M Delta Candles: {delta_bars}"
+            f"Base Price: ${base_p}\n"
+            f"Recent 20 15M Delta Candles: {delta_15m}\n"
+            f"Recent 40 5M Delta Candles: {delta_5m}"
         )
         threading.Thread(
             target=_background_ai_confirm_worker,
