@@ -30,9 +30,42 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import pytz
 
-import nifty50
-import gold
-import bitcoin
+import sys
+import glob
+import importlib.util
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+
+def _load_market_module(aliases: tuple):
+    for name in aliases:
+        try:
+            return __import__(name)
+        except ModuleNotFoundError:
+            pass
+    for name in aliases:
+        candidates = sorted(
+            [p for p in glob.glob(os.path.join(BASE_DIR, f"{name}*.py")) if os.path.basename(p) != "main.py"],
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        if candidates:
+            spec = importlib.util.spec_from_file_location(aliases[0], candidates[0])
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[aliases[0]] = mod
+            spec.loader.exec_module(mod)
+            return mod
+    present = sorted(os.listdir(BASE_DIR))
+    raise ModuleNotFoundError(
+        f"Missing '{aliases[0]}.py' in {BASE_DIR}. Files found: {present}."
+    )
+
+
+nifty50 = _load_market_module(("nifty_bot", "nifty50"))
+gold = _load_market_module(("gold_bot", "gold"))
+bitcoin = _load_market_module(("btc_bot", "bitcoin"))
 
 IST = pytz.timezone("Asia/Kolkata")
 logging.basicConfig(
@@ -45,6 +78,10 @@ PORT            = int(os.getenv("PORT", "8080"))
 REDIS_URL       = os.getenv("REDIS_URL", "").strip()
 TG_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+ENABLE_NIFTY    = os.getenv("ENABLE_NIFTY", "true").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_GOLD     = os.getenv("ENABLE_GOLD", "true").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_BTC      = os.getenv("ENABLE_BTC", "true").strip().lower() in ("1", "true", "yes", "on")
 
 HYDROGEN_MODEL  = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-hydrogen").strip()
 LITE_35_MODEL   = os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite").strip()
@@ -203,9 +240,9 @@ def run_first_5min_startup_diagnostics():
     now = datetime.now(IST)
 
     # 1. Test Data APIs + trigger initial Top-Down / 6H Zone Syncs
-    nifty_diag = nifty50.run_startup_diagnostics(shared_store)
-    gold_diag = gold.run_startup_diagnostics(shared_store)
-    btc_diag = bitcoin.run_startup_diagnostics(shared_store)
+    nifty_diag = nifty50.run_startup_diagnostics(shared_store) if ENABLE_NIFTY else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    gold_diag = gold.run_startup_diagnostics(shared_store) if ENABLE_GOLD else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    btc_diag = bitcoin.run_startup_diagnostics(shared_store) if ENABLE_BTC else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
 
     # 2. Test all 3 Gemini AI Models
     m_hydro = _ping_gemini_model(HYDROGEN_MODEL, "HIGH")
@@ -287,10 +324,13 @@ def main():
             # Consolidated Morning Health Check (09:03 - 09:10 IST)
             check_consolidated_morning_health()
 
-            # Launch all 3 market engines in parallel non-blocking daemon threads
-            threading.Thread(target=nifty50.run_nifty_cycle, args=(shared_store,), daemon=True).start()
-            threading.Thread(target=gold.run_gold_cycle, args=(shared_store,), daemon=True).start()
-            threading.Thread(target=bitcoin.run_btc_cycle, args=(shared_store,), daemon=True).start()
+            # Launch enabled market engines in parallel non-blocking daemon threads
+            if ENABLE_NIFTY:
+                threading.Thread(target=nifty50.run_nifty_cycle, args=(shared_store,), daemon=True).start()
+            if ENABLE_GOLD:
+                threading.Thread(target=gold.run_gold_cycle, args=(shared_store,), daemon=True).start()
+            if ENABLE_BTC:
+                threading.Thread(target=bitcoin.run_btc_cycle, args=(shared_store,), daemon=True).start()
 
         except Exception as e:
             log.error(f"[MAIN] Loop error: {type(e).__name__}")
