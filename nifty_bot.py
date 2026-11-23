@@ -1,37 +1,23 @@
 """
 ================================================================================
-NIFTY 50 PURE LIQUIDITY ENGINE — PRODUCTION V10.0
+NIFTY 50 PURE LIQUIDITY ENGINE — PRODUCTION V10.5 (ZERO-NOISE EDITION)
 Namespace: NIFTY:* | Upstox V3 API | 100% Price Action (Zero EMA / RSI / ATR)
 ================================================================================
-ARCHITECTURE:
-  • Schedule (IST):
-    - 09:20 IST: Morning BIG Multi-TF Analysis (1D + 1H + 15M + 5M)
-    - 10:20, 11:20, 12:20, 13:20, 14:20 IST: Hourly Intraday Zone Sync
-    - Every 5M Candle Close (:05s): Zero-Lag Python Liquidity Hunt Scanner
-  • Dynamic Historical Price-Band Slice (Zone Vacuum Protection):
-    - Triggers if < 2 untouched zones exist within LTP ± 300 pts.
-    - Fetches 3-Year 1D/1W history, filters ONLY candles inside LTP ± 600 pts
-      + Today's intraday candles (60m band cooldown).
-    - On New All-Time High (0 historical candles in band), runs seamlessly on
-      Current-Day Data + Real-Time Dynamic Swing Zones.
-  • Pure Liquidity Setups (Entry-Only Mode — Manual SL & Target):
-    1. OLD_HTF_BLUE_BOX (1D / 1H / 15M untouched up to 85d + AI-marked zones)
-    2. MULTI_TOUCH_SHELF (2+ untouched swings within 12 pts)
-    3. 1ST_15M_LIQ_POOL (Today's 09:15-09:30 High/Low liquidity sweep)
-    4. EXHAUSTION_TRAP_PT10 (3+ same-color candles / big bar into Blue Box)
-    5. TREND_PULLBACK_LIQ_HUNT (HH+HL / LH+LL impulse pullback sweep)
-    6. BREAKOUT_FLIP_HUNT (Broken 1D/1H Blue Box retest with trend)
-    7. DUAL_SIDE_HUNT_PT7 (Consolidation sweeps Side A first, then Side B)
-    8. CURRENT_DAY_DYNAMIC_ZONE (Real-time swing Blue Box formed today)
-  • AI Model Chain (No 3.8/3.6):
-    - Heavy / Hourly: gemini-4-hydrogen (HIGH) -> gemini-3.5-flash-lite (HIGH) -> gemini-3.1-flash-lite (OFF)
-    - Live Confirm  : gemini-3.5-flash-lite (HIGH) -> gemini-3.1-flash-lite (OFF)
+UPGRADES IN V10.5:
+  1. Removes noisy CURRENT_DAY_5M micro-ripples & negative-edge DUAL_SIDE_HUNT_PT7.
+  2. Adds genuine BREAKOUT_FLIP_HUNT on broken 1D/1H Blue Boxes (with-trend only).
+  3. Live Dynamic PA Regime (1H structure + 15M rapid displacement guard).
+  4. Zombie / Broken Zone Purge (Resistance strictly above LTP, Support strictly below).
+  5. Strict 5-Gate Filter: Clean Approach (>=2/4 prior closes inside), Strict Piercing
+     (>=1.5 pts & <=2.2x scale), Dead-Session (>=10 pts) & Anti-Spike (<=3.5x scale).
+  6. Real OHLC Sent to AI (ZERO "Delta" word hallucination in AI verdicts).
+  7. Weekend-Safe Startup Check (days_back=5 fixes Monday false OFFLINE alert).
+  8. Zone marked spent ONLY AFTER cooldown/lock checks approve the alert.
 ================================================================================
 """
 
 import os
 import json
-import math
 import time
 import html
 import logging
@@ -58,7 +44,6 @@ NIFTY_SYMBOL_KEY    = "NSE_INDEX|Nifty 50"
 NIFTY_KEY_ENC       = quote(NIFTY_SYMBOL_KEY)
 UPSTOX_V3_BASE      = "https://api.upstox.com/v3"
 
-# AI Models
 HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-hydrogen").strip()
 LITE_35_MODEL       = os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite").strip()
 LITE_31_MODEL       = os.getenv("GEMINI_31_LITE_MODEL", "gemini-3.1-flash-lite").strip()
@@ -74,14 +59,17 @@ LIVE_CONFIRM_CHAIN = [
     (LITE_31_MODEL,  "OFF",   30, 2048),
 ]
 
-# Pure Liquidity Constants (NIFTY Index Points)
+# Pure Liquidity Constants (NIFTY Index Points — V10.5)
 CANDLE_BUFFER_SEC   = 2
-ZONE_BUFFER_PTS     = 3.0
 SHELF_MERGE_PTS     = 12.0
+FLIP_BREAK_PTS      = 15.0
+MIN_PIERCE_PTS      = 1.5
+MAX_OVERSHOOT_PTS   = 32.0
+MIN_RNG_5M_PTS      = 10.0
+MAX_RNG_MULT        = 3.5
 MAX_ZONE_AGE_DAYS   = 85
-VACUUM_RADIUS_PTS   = 300.0   # User-specified: trigger deep band if < 2 zones in LTP ± 300 pts
-DEEP_BAND_PTS       = 600.0   # Wide rally/crash historical slice: LTP ± 600 pts
-MIN_RISK_PTS        = 22.0
+VACUUM_RADIUS_PTS   = 300.0
+DEEP_BAND_PTS       = 600.0
 SETUP_COOLDOWN_MIN  = int(os.getenv("NIFTY_SETUP_COOLDOWN_MIN", "45"))
 OPPOSITE_LOCK_MIN   = int(os.getenv("NIFTY_OPPOSITE_LOCK_MIN", "30"))
 
@@ -132,15 +120,18 @@ class NiftyState:
     def set(self, key: str, value, ttl: int = 86400):
         self.store.set(f"{self.PREFIX}{key}", value, ttl=ttl)
 
-    def get(self, key: str):
-        return self.store.get(f"{self.PREFIX}{key}")
+    def get(self, key: str, default=None):
+        val = self.store.get(f"{self.PREFIX}{key}")
+        return default if val is None else val
 
     def mark_spent(self, zone_id: str, ttl: int = 172800):
+        if not zone_id:
+            return
         spent = self.get("spent_zones") or []
         if zone_id not in spent:
             spent.append(zone_id)
-            if len(spent) > 400:
-                spent = spent[-400:]
+            if len(spent) > 500:
+                spent = spent[-500:]
             self.set("spent_zones", spent, ttl=ttl)
 
     def is_spent(self, zone_id: str) -> bool:
@@ -161,7 +152,6 @@ def tg_send(text: str) -> bool:
             timeout=12,
         )
         if r.status_code != 200:
-            # Plain-text fallback if HTML tag fails
             plain = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
             r2 = requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
@@ -176,7 +166,7 @@ def tg_send(text: str) -> bool:
 
 
 # ==============================================================================
-# GEMINI AI ENGINE (NO thinkingBudget:0 BUG + thought PART FILTERING)
+# GEMINI AI ENGINE (SMART 429/503 BACKOFF + NO thinkingBudget:0 BUG)
 # ==============================================================================
 def _bump_ai_counter():
     global _daily_ai_calls, _daily_ai_date
@@ -205,9 +195,10 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
     if not GEMINI_API_KEYS:
         return None
 
-    for _ in range(len(GEMINI_API_KEYS)):
+    attempts = max(2, len(GEMINI_API_KEYS) * 2)
+    for attempt in range(attempts):
         with _ai_rate_lock:
-            wait = 4.1 - (time.time() - _last_gemini_call)
+            wait = 2.2 - (time.time() - _last_gemini_call)
             if wait > 0:
                 time.sleep(wait)
             _last_gemini_call = time.time()
@@ -221,7 +212,6 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
         }
-        # Only attach thinkingConfig when thinking is ON (never send thinkingBudget: 0)
         if thinking_lvl and thinking_lvl.upper() != "OFF":
             if "4-hydrogen" in model_name:
                 gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_lvl.upper()}
@@ -242,11 +232,15 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
                 r = requests.post(url, json=payload, timeout=timeout_sec)
 
             if r.status_code == 429:
-                log.warning(f"[NIFTY] {model_name} HTTP 429 rate limit — rotating key...")
+                backoff = min(6.0, 1.5 + attempt * 1.2)
+                log.warning(f"[NIFTY] {model_name} HTTP 429 — rotating key after {backoff:.1f}s...")
+                time.sleep(backoff)
                 continue
             if r.status_code in (500, 502, 503, 504):
-                log.warning(f"[NIFTY] {model_name} HTTP {r.status_code} — falling back...")
-                break
+                backoff = min(6.0, 1.5 + attempt * 1.5)
+                log.warning(f"[NIFTY] {model_name} HTTP {r.status_code} — retrying in {backoff:.1f}s...")
+                time.sleep(backoff)
+                continue
             if r.status_code == 200:
                 cands = r.json().get("candidates", [])
                 if cands:
@@ -260,11 +254,13 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
                 log.warning(f"[NIFTY] {model_name} HTTP {r.status_code}")
                 break
         except requests.Timeout:
-            log.warning(f"[NIFTY] {model_name} timeout ({timeout_sec}s) — falling back...")
-            break
+            log.warning(f"[NIFTY] {model_name} timeout ({timeout_sec}s) — retrying once...")
+            time.sleep(1.5)
+            continue
         except Exception as e:
-            log.warning(f"[NIFTY] {model_name} error ({type(e).__name__}) — falling back...")
-            break
+            log.warning(f"[NIFTY] {model_name} error ({type(e).__name__}) — retrying once...")
+            time.sleep(1.5)
+            continue
     return None
 
 
@@ -277,7 +273,7 @@ def call_gemini_chain(chain: list, sys_prompt: str, user_prompt: str):
 
 
 # ==============================================================================
-# UPSTOX V3 CANDLE FETCHER + CLOSED-CANDLE BUFFER GUARD
+# UPSTOX V3 CANDLE FETCHER + REAL OHLC FORMATTER (ZERO "DELTA" WORD)
 # ==============================================================================
 def _ensure_ist(ts_val) -> datetime:
     dt = pd.Timestamp(ts_val).to_pydatetime()
@@ -354,26 +350,19 @@ def fetch_upstox_candles(unit: str, interval: int, days_back: int, include_intra
     return df
 
 
-# ==============================================================================
-# COMPACT DELTA ENCODER (SAVES 70% TOKENS)
-# ==============================================================================
-def encode_delta_candles(df: pd.DataFrame, limit: int, base_price: int, fmt: str = "%m-%d %H:%M") -> list:
+def format_ohlc_candles(df: pd.DataFrame, limit: int, fmt: str = "%m-%d %H:%M") -> list:
     if df is None or df.empty:
         return []
     sub = df.tail(limit)
     out = []
     for _, r in sub.iterrows():
         t_s = _ensure_ist(r["ts"]).strftime(fmt)
-        o = int(round(float(r["o"]) - base_price))
-        h = int(round(float(r["h"]) - base_price))
-        l = int(round(float(r["l"]) - base_price))
-        c = int(round(float(r["c"]) - base_price))
-        out.append(f"{t_s}: O{o:+d} H{h:+d} L{l:+d} C{c:+d}")
+        out.append(f"{t_s} O:{float(r['o']):.1f} H:{float(r['h']):.1f} L:{float(r['l']):.1f} C:{float(r['c']):.1f}")
     return out
 
 
 # ==============================================================================
-# PURE PRICE-ACTION REGIME & PERSISTENT BLUE BOX ENGINE (ZERO INDICATORS)
+# LIVE DYNAMIC PA REGIME & ZOMBIE-FREE BLUE BOX ENGINE (ZERO INDICATORS)
 # ==============================================================================
 def _median_range(df: pd.DataFrame, n: int = 20) -> float:
     if df is None or df.empty:
@@ -382,35 +371,66 @@ def _median_range(df: pd.DataFrame, n: int = 20) -> float:
     return v if v > 0 else 15.0
 
 
-def get_pure_pa_regime(h1_df: pd.DataFrame) -> str:
-    """Pure HH+HL vs LH+LL structure regime on completed 1H bars (NO EMAs)."""
-    if h1_df is None or len(h1_df) < 10:
-        return "SIDEWAYS"
-    sub = h1_df.tail(10)
-    hh = sub["h"].values
-    ll = sub["l"].values
-    cc = sub["c"].values
-    sc = float(np.median(hh - ll))
-    ph, pl = np.max(hh[:5]), np.min(ll[:5])
-    ch, cl = np.max(hh[5:]), np.min(ll[5:])
-    net_mv = float(cc[-1] - cc[4])
-    if (ch > ph and cl > pl) or net_mv > 1.7 * sc:
-        return "TRENDING_BULL"
-    if (ch < ph and cl < pl) or net_mv < -1.7 * sc:
-        return "TRENDING_BEAR"
-    return "SIDEWAYS"
+def get_live_pa_regime(h1_df: pd.DataFrame, m15_df: pd.DataFrame) -> tuple:
+    reg = "SIDEWAYS"
+    if h1_df is not None and len(h1_df) >= 10:
+        sub = h1_df.tail(10)
+        hh, ll, cc = sub["h"].values, sub["l"].values, sub["c"].values
+        sc = float(np.median(hh - ll))
+        ph, pl = np.max(hh[:5]), np.min(ll[:5])
+        ch, cl = np.max(hh[5:]), np.min(ll[5:])
+        net_mv = float(cc[-1] - cc[4])
+        if (ch > ph and cl > pl) or net_mv > 1.7 * sc:
+            reg = "TRENDING_BULL"
+        elif (ch < ph and cl < pl) or net_mv < -1.7 * sc:
+            reg = "TRENDING_BEAR"
+
+    disp_15m = "NONE"
+    if m15_df is not None and len(m15_df) >= 10:
+        sc15 = _median_range(m15_df, 20)
+        mv = float(m15_df["c"].iloc[-1] - m15_df["c"].iloc[-5])
+        if mv > 2.8 * sc15:
+            disp_15m = "TRENDING_BULL"
+        elif mv < -2.8 * sc15:
+            disp_15m = "TRENDING_BEAR"
+
+    if reg == "SIDEWAYS" and disp_15m != "NONE":
+        reg = disp_15m
+    return reg, disp_15m
+
+
+def _update_or_purge_zone(z: dict, df_5m: pd.DataFrame, ltp: float) -> str:
+    """
+    Returns:
+      'KEEP'  -> valid untouched (or flipped) zone
+      'FLIP'  -> major 1D/1H zone cleanly broken -> flip polarity for BREAKOUT_FLIP_HUNT
+      'PURGE' -> broken zombie zone -> remove & mark spent
+    """
+    piv = float(z["pivot"])
+    ztype = z["type"]
+    c_prev1 = float(df_5m["c"].iloc[-2]) if (df_5m is not None and len(df_5m) >= 3) else ltp
+    c_prev2 = float(df_5m["c"].iloc[-3]) if (df_5m is not None and len(df_5m) >= 4) else ltp
+
+    is_broken = False
+    if ztype == "RESISTANCE":
+        if (c_prev1 > piv + FLIP_BREAK_PTS and c_prev2 > piv + FLIP_BREAK_PTS * 0.4) or ltp > piv + FLIP_BREAK_PTS * 2.5:
+            is_broken = True
+    elif ztype == "SUPPORT":
+        if (c_prev1 < piv - FLIP_BREAK_PTS and c_prev2 < piv - FLIP_BREAK_PTS * 0.4) or ltp < piv - FLIP_BREAK_PTS * 2.5:
+            is_broken = True
+
+    if not is_broken:
+        return "KEEP"
+    if not z.get("flipped") and z.get("tf") in ("1D_BLUE_BOX", "1H_BLUE_BOX"):
+        return "FLIP"
+    return "PURGE"
 
 
 def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd.DataFrame, df_5m: pd.DataFrame, ltp: float, now_ist: datetime, state: NiftyState) -> list:
-    """
-    Extracts UNTOUCHED Blue Boxes across 1D, 1H, 15M (up to 85 days old),
-    merges nearby levels into MULTI_TOUCH_SHELF, and adds CURRENT_DAY_DYNAMIC_ZONE
-    from today's intraday swings so rallies/new highs never run out of zones.
-    """
     specs = [
         (df_1d,  "1D_BLUE_BOX",  3, 2, 1.3, 1),
         (df_1h,  "1H_BLUE_BOX",  6, 3, 1.8, 2),
-        (df_15m, "15M_BLUE_BOX", 8, 4, 2.0, 3),
+        (df_15m, "15M_BLUE_BOX", 6, 3, 1.8, 3),
     ]
     raw_boxes = []
     for df, tf_lbl, lb, rb, rev_mult, prio in specs:
@@ -433,7 +453,7 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd
                         raw_boxes.append({
                             "id": zid, "type": "RESISTANCE", "tf": tf_lbl, "prio": prio,
                             "pivot": round(float(hh[k]), 2), "age_days": age_d, "touches": 1,
-                            "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ {hh[k]:.2f}"
+                            "flipped": False, "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ {hh[k]:.2f}"
                         })
 
             if ll[k] == np.min(ll[k - lb : k + rb + 1]):
@@ -445,48 +465,30 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd
                         raw_boxes.append({
                             "id": zid, "type": "SUPPORT", "tf": tf_lbl, "prio": prio,
                             "pivot": round(float(ll[k]), 2), "age_days": age_d, "touches": 1,
-                            "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ {ll[k]:.2f}"
+                            "flipped": False, "source": "PYTHON_HTF", "why": f"{tf_lbl} ({age_d}d old) @ {ll[k]:.2f}"
                         })
 
-    # Add Current-Day Real-Time Dynamic Zones (5M/15M untouched swings formed TODAY)
-    if df_5m is not None and len(df_5m) >= 12:
-        today_str = now_ist.strftime("%Y-%m-%d")
-        df_today = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") == today_str].reset_index(drop=True)
-        if len(df_today) >= 8:
-            sc5 = _median_range(df_today, 15)
-            hh5, ll5, cc5 = df_today["h"].values, df_today["l"].values, df_today["c"].values
-            for k in range(3, len(df_today) - 3):
-                ft = _ensure_ist(df_today["ts"].iloc[k])
-                if hh5[k] == np.max(hh5[k - 3 : k + 3]) and (hh5[k] - np.min(ll5[k + 1 : k + 3])) >= 1.2 * sc5:
-                    if len(hh5[k + 3 : -1]) == 0 or (np.max(hh5[k + 3 : -1]) <= hh5[k] and np.max(cc5[k + 3 : -1]) <= hh5[k]):
-                        zid = f"CURR_DAY_H_{int(hh5[k])}_{ft.strftime('%H%M')}"
-                        if not state.is_spent(zid):
-                            raw_boxes.append({
-                                "id": zid, "type": "RESISTANCE", "tf": "CURRENT_DAY_5M", "prio": 4,
-                                "pivot": round(float(hh5[k]), 2), "age_days": 0, "touches": 1,
-                                "source": "CURRENT_DAY_DYNAMIC", "why": f"Today {ft.strftime('%H:%M')} Swing High @ {hh5[k]:.2f}"
-                            })
-                if ll5[k] == np.min(ll5[k - 3 : k + 3]) and (np.max(hh5[k + 1 : k + 3]) - ll5[k]) >= 1.2 * sc5:
-                    if len(ll5[k + 3 : -1]) == 0 or (np.min(ll5[k + 3 : -1]) >= ll5[k] and np.min(cc5[k + 3 : -1]) >= ll5[k]):
-                        zid = f"CURR_DAY_L_{int(ll5[k])}_{ft.strftime('%H%M')}"
-                        if not state.is_spent(zid):
-                            raw_boxes.append({
-                                "id": zid, "type": "SUPPORT", "tf": "CURRENT_DAY_5M", "prio": 4,
-                                "pivot": round(float(ll5[k]), 2), "age_days": 0, "touches": 1,
-                                "source": "CURRENT_DAY_DYNAMIC", "why": f"Today {ft.strftime('%H:%M')} Swing Low @ {ll5[k]:.2f}"
-                            })
-
-    # Merge AI-saved zones from state
-    ai_zones = state.get("ai_zones") or []
-    for az in ai_zones:
+    for az in (state.get("ai_zones") or []):
         if not state.is_spent(az["id"]) and abs(float(az["pivot"]) - ltp) <= DEEP_BAND_PTS:
             raw_boxes.append(az)
 
-    # Deduplicate & merge nearby untouched swings (within 12 pts) into MULTI_TOUCH_SHELF
-    raw_boxes.sort(key=lambda x: (x.get("prio", 3), abs(float(x["pivot"]) - ltp)))
+    clean_boxes = []
+    for z in raw_boxes:
+        status = _update_or_purge_zone(z, df_5m, ltp)
+        if status == "PURGE":
+            state.mark_spent(z["id"])
+        elif status == "FLIP":
+            zf = dict(z)
+            zf["type"] = "SUPPORT" if z["type"] == "RESISTANCE" else "RESISTANCE"
+            zf["flipped"] = True
+            clean_boxes.append(zf)
+        else:
+            clean_boxes.append(z)
+
+    clean_boxes.sort(key=lambda x: (x.get("prio", 3), abs(float(x["pivot"]) - ltp)))
     merged = []
-    for cand in raw_boxes:
-        m = next((x for x in merged if x["type"] == cand["type"] and abs(float(x["pivot"]) - float(cand["pivot"])) <= SHELF_MERGE_PTS), None)
+    for cand in clean_boxes:
+        m = next((x for x in merged if x["type"] == cand["type"] and x.get("flipped") == cand.get("flipped") and abs(float(x["pivot"]) - float(cand["pivot"])) <= SHELF_MERGE_PTS), None)
         if m:
             if not str(m.get("source", "")).startswith("AI_") and not str(cand.get("source", "")).startswith("AI_"):
                 m["touches"] = m.get("touches", 1) + 1
@@ -504,21 +506,20 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_1h: pd.DataFrame, df_15m: pd
 # ==============================================================================
 BAND_SLICE_SYS_PROMPT = (
     "You are the NIFTY 50 Historical Liquidity Archaeologist (100% Pure Price Action — No Indicators).\n"
-    "The market entered a price zone with fewer than 2 nearby untouched zones.\n"
-    "Analyze ONLY the supplied historical candles inside LTP ± 600 pts + today's intraday candles.\n"
-    "Identify untouched historical Blue Boxes (Swing Highs/Lows) and current-day dynamic zones.\n"
+    "NIFTY entered a price zone with fewer than 2 nearby untouched zones.\n"
+    "Analyze ONLY the supplied REAL OHLC historical candles inside LTP ± 600 pts + today's intraday candles.\n"
+    "Mark ONLY genuine untouched RESISTANCE strictly ABOVE LTP and SUPPORT strictly BELOW LTP.\n"
     "Respond ONLY in strictly valid JSON:\n"
     '{"regime_update": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
-    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "HIST_1D|HIST_1W|CURR_DAY", "pivot": 0.0, "why": "short reason"}]}'
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "HIST_1D|HIST_1W|15M", "pivot": 0.0, "why": "short reason"}]}'
 )
 
 
-def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, df_5m: pd.DataFrame):
+def _run_historical_band_slice_worker(shared_store, ltp: float, df_15m: pd.DataFrame):
     state = NiftyState(shared_store)
     now = datetime.now(IST)
     low_b, high_b = round(ltp - DEEP_BAND_PTS, 1), round(ltp + DEEP_BAND_PTS, 1)
 
-    # Fetch 3-year 1D historical candles & derive 1W cleanly via pandas resample
     df_1d_3y = fetch_upstox_candles("days", 1, days_back=1095, include_intraday=False, closed_only=True)
     df_1w_3y = pd.DataFrame()
     if df_1d_3y is not None and not df_1d_3y.empty:
@@ -534,30 +535,24 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
     for df_h, lbl in [(df_1w_3y, "1W"), (df_1d_3y, "1D")]:
         if df_h is None or df_h.empty:
             continue
-        in_band = df_h[(df_h["h"] >= low_b) & (df_h["l"] <= high_b)].tail(35)
+        in_band = df_h[(df_h["h"] >= low_b) & (df_h["l"] <= high_b)].tail(30)
         for _, r in in_band.iterrows():
             dt_s = _ensure_ist(r["ts"]).strftime("%Y-%m-%d")
-            hist_hits.append(f"{lbl} {dt_s}: O={r['o']} H={r['h']} L={r['l']} C={r['c']}")
+            hist_hits.append(f"{lbl} {dt_s} O:{r['o']:.1f} H:{r['h']:.1f} L:{r['l']:.1f} C:{r['c']:.1f}")
 
-    # All-Time High / Uncharted Price Fallback: 0 historical candles in band -> run purely on Current Day data!
     if not hist_hits:
-        log.info(f"[NIFTY] 🚀 Uncharted Price / New High @ {ltp:.2f} (0 historical bars in {low_b}-{high_b}). Running Current-Day Dynamic Mode.")
+        log.info(f"[NIFTY] 🚀 Uncharted Price / New High @ {ltp:.2f} (0 historical bars in {low_b}-{high_b}). Running Intraday 15M/Trend Mode.")
         tg_send(
             f"🚀 <b>[NIFTY 50 NEW PRICE TERRITORY] {ltp:.2f}</b>\n"
-            f"• 3-Year historical data has 0 candles in <code>{low_b}–{high_b}</code>.\n"
-            f"• Switched automatically to <b>Current-Day Dynamic Zones + Trend Pullback Liquidity Hunts</b>."
+            f"• 3-Year history has 0 candles in <code>{low_b}–{high_b}</code>.\n"
+            f"• Tracking <b>15M Blue Boxes + 1st 15M Pool + Trend Pullback Liquidity Hunts</b>."
         )
         return
 
-    base_p = int(math.floor(low_b / 500.0) * 500)
-    today_str = now.strftime("%Y-%m-%d")
-    df_today = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") == today_str] if (df_5m is not None and not df_5m.empty) else pd.DataFrame()
-    today_delta = encode_delta_candles(df_today, 60, base_p, "%H:%M")
-
     usr_p = (
-        f"Asset: NIFTY 50 | LTP: {ltp:.2f} | Band: {low_b} to {high_b} (±{int(DEEP_BAND_PTS)} pts)\n"
-        f"Historical Candles Inside Band ({len(hist_hits)} bars):\n" + "\n".join(hist_hits[:45]) + "\n\n"
-        f"Current Day 5M Candles (Base={base_p}):\n" + "\n".join(today_delta)
+        f"Asset: NIFTY 50 | Current LTP: {ltp:.2f} | Band: {low_b} to {high_b}\n"
+        f"Historical Real OHLC Inside Band ({len(hist_hits)} bars):\n" + "\n".join(hist_hits[:40]) + "\n\n"
+        f"Recent 15M Real OHLC Candles:\n" + "\n".join(format_ohlc_candles(df_15m, 25))
     )
 
     ai_res, provider = call_gemini_chain(HEAVY_AI_CHAIN, BAND_SLICE_SYS_PROMPT, usr_p)
@@ -566,16 +561,18 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
 
     existing_ai = state.get("ai_zones") or []
     added = []
-    for idx, z in enumerate(ai_res["zones"][:10]):
+    for z in ai_res["zones"][:10]:
         try:
             piv = round(float(z["pivot"]), 2)
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_PTS:
                 continue
+            if (ztype == "RESISTANCE" and piv <= ltp) or (ztype == "SUPPORT" and piv >= ltp):
+                continue
             zid = f"AI_BAND_{ztype[:3]}_{int(piv)}_{now.strftime('%Y%m%d')}"
             item = {
                 "id": zid, "type": ztype, "tf": str(z.get("tf", "HIST_1D")), "prio": 2,
-                "pivot": piv, "age_days": 30, "touches": 1,
+                "pivot": piv, "age_days": 30, "touches": 1, "flipped": False,
                 "source": "AI_HISTORICAL_BAND", "why": str(z.get("why", "Historical Band Blue Box"))
             }
             existing_ai.append(item)
@@ -585,17 +582,15 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, band_key: str, d
 
     if added:
         state.set("ai_zones", existing_ai[-30:], ttl=86400)
-        cur_active = state.get("active_zones") or []
-        state.set("active_zones", (added + cur_active)[:25], ttl=86400)
         lines = [f"• <b>{z['type']}</b> @ <code>{z['pivot']}</code> ({esc(z['why'])})" for z in added[:5]]
         tg_send(
             f"🧭 <b>[NIFTY 50 DEEP BAND SYNC | {esc(provider)}]</b>\n"
             f"• Zone Vacuum (&lt;2 zones in ±300 pts) triggered 3-Yr Band Slice (<code>{low_b}–{high_b}</code>)\n"
-            f"• Added <b>{len(added)}</b> Historical + Current-Day Blue Boxes for Python tracking:\n" + "\n".join(lines)
+            f"• Added <b>{len(added)}</b> Historical Blue Boxes:\n" + "\n".join(lines)
         )
 
 
-def check_zone_vacuum_and_trigger_band(state: NiftyState, zones: list, ltp: float, df_5m: pd.DataFrame):
+def check_zone_vacuum_and_trigger_band(state: NiftyState, zones: list, ltp: float, df_15m: pd.DataFrame):
     nearby = [z for z in zones if abs(float(z["pivot"]) - ltp) <= VACUUM_RADIUS_PTS]
     if len(nearby) >= 2:
         return
@@ -603,13 +598,8 @@ def check_zone_vacuum_and_trigger_band(state: NiftyState, zones: list, ltp: floa
     lock_key = f"band_slice_lock_{band_bucket}"
     if state.get(lock_key):
         return
-    state.set(lock_key, True, ttl=3600)  # 60-minute band cooldown
-    log.info(f"[NIFTY] Zone Vacuum detected (<2 zones in {ltp:.1f} ± {VACUUM_RADIUS_PTS}). Launching Historical Band Slice...")
-    threading.Thread(
-        target=_run_historical_band_slice_worker,
-        args=(state.store, ltp, lock_key, df_5m),
-        daemon=True,
-    ).start()
+    state.set(lock_key, True, ttl=3600)
+    threading.Thread(target=_run_historical_band_slice_worker, args=(state.store, ltp, df_15m), daemon=True).start()
 
 
 # ==============================================================================
@@ -617,17 +607,17 @@ def check_zone_vacuum_and_trigger_band(state: NiftyState, zones: list, ltp: floa
 # ==============================================================================
 TOP_DOWN_SYS_PROMPT = (
     "You are the NIFTY 50 Top-Down Pure Liquidity Architect (1D -> 1H -> 15M -> 5M).\n"
-    "Zero EMA/RSI/ATR. Analyze market structure and mark untouched Blue Boxes (Swing Highs/Lows, "
-    "Multi-Touch Shelves, and Current-Day newly formed liquidity zones) for Python to track.\n"
-    "All candle values are delta-encoded from BASE (real price = delta + BASE).\n"
+    "Zero indicators (No EMA/RSI/ATR). All prices provided are REAL OHLC Index prices.\n"
+    "Determine regime and mark ONLY genuine untouched Blue Boxes: RESISTANCE strictly ABOVE LTP, "
+    "SUPPORT strictly BELOW LTP (never mark already-broken levels).\n"
     "Respond ONLY in strictly valid JSON:\n"
     '{"regime": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
     '"if_then_plan": "1 concise sentence IF-THEN plan", '
-    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "1D|1H|15M|CURR_DAY", "pivot": 0.0, "why": "short reason"}]}'
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "1D|1H|15M", "pivot": 0.0, "why": "short reason"}]}'
 )
 
 
-def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: str):
+def _execute_topdown_sync_worker(shared_store, is_morning_big: bool):
     state = NiftyState(shared_store)
     now = datetime.now(IST)
 
@@ -640,18 +630,17 @@ def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: s
         df_1d = None
         df_1h = fetch_upstox_candles("hours", 1, days_back=15, include_intraday=True, closed_only=True)
         df_15m = fetch_upstox_candles("minutes", 15, days_back=10, include_intraday=True, closed_only=True)
-        df_5m = fetch_upstox_candles("minutes", 5, days_back=3, include_intraday=True, closed_only=True)
+        df_5m = fetch_upstox_candles("minutes", 5, days_back=5, include_intraday=True, closed_only=True)
 
     if df_5m is None or df_5m.empty:
         return
 
     ltp = float(df_5m["c"].iloc[-1])
-    pa_regime = get_pure_pa_regime(df_1h)
+    pa_regime, _ = get_live_pa_regime(df_1h, df_15m)
     py_zones = extract_pure_blue_boxes(df_1d, df_1h, df_15m, df_5m, ltp, now, state)
     state.set("active_zones", py_zones, ttl=86400)
-    state.set("regime", pa_regime, ttl=14400)
+    state.set("ai_regime", pa_regime, ttl=14400)
 
-    # Publish Python Distance-Ring Map immediately (0-lag)
     r1 = [z for z in py_zones if abs(z["pivot"] - ltp) <= 75]
     r2 = [z for z in py_zones if 75 < abs(z["pivot"] - ltp) <= 150]
     r3 = [z for z in py_zones if 150 < abs(z["pivot"] - ltp) <= 300]
@@ -667,25 +656,17 @@ def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: s
     )
     tg_send(
         f"🏛️ <b>[NIFTY 50] {title}</b>\n"
-        f"📊 <b>LTP:</b> <b>{ltp:.2f}</b> | <b>PA Regime:</b> <code>{pa_regime}</code> | <b>Zones:</b> <code>{len(py_zones)}</code>\n"
+        f"📊 <b>LTP:</b> <b>{ltp:.2f}</b> | <b>Live PA Regime:</b> <code>{pa_regime}</code> | <b>Valid Zones:</b> <code>{len(py_zones)}</code>\n"
         f"{ring_txt}\n⏳ <i>Running {esc(HYDROGEN_MODEL)} background zone refinement...</i>"
     )
 
-    # Build Compact Delta Payload for AI
-    base_p = int(math.floor(ltp / 500.0) * 500)
-    today_str = now.strftime("%Y-%m-%d")
-    prev_5m = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") < today_str].tail(45)
-    curr_5m = df_5m[df_5m["ts"].dt.strftime("%Y-%m-%d") == today_str]
-    bars_5m = encode_delta_candles(pd.concat([prev_5m, curr_5m]), 90, base_p, "%m-%d %H:%M")
-
     usr_p = (
-        f"Asset: NIFTY 50 | Mode: {title} | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | LTP: {ltp:.2f}\n"
-        f"Base Price for Delta Decoding: {base_p}\n"
-        f"Python Pre-Detected Zones: {json.dumps([{'type': z['type'], 'tf': z['tf'], 'pivot': z['pivot'], 'age_d': z['age_days']} for z in py_zones[:10]])}\n"
-        + (f"1D Candles (30): {encode_delta_candles(df_1d, 30, base_p, '%Y-%m-%d')}\n" if df_1d is not None and not df_1d.empty else "")
-        + f"1H Candles: {encode_delta_candles(df_1h, 35 if is_morning_big else 21, base_p)}\n"
-        + f"15M Candles: {encode_delta_candles(df_15m, 35 if is_morning_big else 28, base_p)}\n"
-        + f"5M Candles (Prev 45 + Today): {bars_5m}"
+        f"Asset: NIFTY 50 | Mode: {title} | Time: {now.strftime('%Y-%m-%d %H:%M IST')} | Current LTP: {ltp:.2f}\n"
+        f"Python Pre-Detected Valid Zones: {json.dumps([{'type': z['type'], 'tf': z['tf'], 'pivot': z['pivot'], 'age_d': z['age_days']} for z in py_zones[:10]])}\n"
+        + (f"1D Real OHLC (25): {format_ohlc_candles(df_1d, 25, '%Y-%m-%d')}\n" if df_1d is not None and not df_1d.empty else "")
+        + f"1H Real OHLC: {format_ohlc_candles(df_1h, 28 if is_morning_big else 20)}\n"
+        + f"15M Real OHLC: {format_ohlc_candles(df_15m, 30 if is_morning_big else 24)}\n"
+        + f"5M Real OHLC (Recent 36): {format_ohlc_candles(df_5m, 36)}"
     )
 
     ai_res, provider = call_gemini_chain(HEAVY_AI_CHAIN, TOP_DOWN_SYS_PROMPT, usr_p)
@@ -694,19 +675,24 @@ def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: s
         return
 
     ai_regime = ai_res.get("regime", pa_regime)
-    state.set("regime", ai_regime, ttl=14400)
+    state.set("ai_regime", ai_regime, ttl=14400)
     ai_saved = state.get("ai_zones") or []
     new_cnt = 0
-    for idx, z in enumerate((ai_res.get("zones") or [])[:12]):
+    for z in (ai_res.get("zones") or [])[:10]:
         try:
             piv = round(float(z["pivot"]), 2)
             ztype = str(z.get("type", "RESISTANCE")).upper()
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_PTS:
                 continue
+            if (ztype == "RESISTANCE" and piv <= ltp) or (ztype == "SUPPORT" and piv >= ltp):
+                continue
+            tf_lbl = str(z.get("tf", "15M_BLUE_BOX")).upper()
+            if tf_lbl in ("1D", "1H", "15M"):
+                tf_lbl = f"{tf_lbl}_BLUE_BOX"
             zid = f"AI_TD_{ztype[:3]}_{int(piv)}_{now.strftime('%Y%m%d')}"
             ai_saved.append({
-                "id": zid, "type": ztype, "tf": str(z.get("tf", "CURR_DAY")), "prio": 2,
-                "pivot": piv, "age_days": 0, "touches": 1,
+                "id": zid, "type": ztype, "tf": tf_lbl, "prio": 2,
+                "pivot": piv, "age_days": 0, "touches": 1, "flipped": False,
                 "source": "AI_TOPDOWN", "why": str(z.get("why", "AI Marked Blue Box"))
             })
             new_cnt += 1
@@ -714,14 +700,13 @@ def _execute_topdown_sync_worker(shared_store, is_morning_big: bool, slot_key: s
             continue
 
     if new_cnt:
-        state.set("ai_zones", ai_saved[-35:], ttl=86400)
-        # Refresh combined zone list for Python tracker
+        state.set("ai_zones", ai_saved[-30:], ttl=86400)
         refreshed = extract_pure_blue_boxes(df_1d, df_1h, df_15m, df_5m, ltp, now, state)
         state.set("active_zones", refreshed, ttl=86400)
 
     tg_send(
         f"🧠 <b>[NIFTY 50 AI ZONE SYNC | {esc(provider)}]</b>\n"
-        f"🧭 <b>AI Regime:</b> <b>{esc(ai_regime)}</b> | <b>Saved Zones:</b> <code>{new_cnt}</code>\n"
+        f"🧭 <b>AI Regime:</b> <b>{esc(ai_regime)}</b> | <b>Saved Valid Zones:</b> <code>{new_cnt}</code>\n"
         f"📋 <b>Plan:</b> <i>{esc(ai_res.get('if_then_plan', 'Tracking Blue Box -> 5M Yellow Box hunts.'))}</i>"
     )
 
@@ -741,62 +726,60 @@ def trigger_topdown_if_due(shared_store=None, force: bool = False):
         return
     state.set(slot_key, True, ttl=14400)
     is_morning_big = (cur_h == 9) or force
-    threading.Thread(
-        target=_execute_topdown_sync_worker,
-        args=(shared_store, is_morning_big, slot_key),
-        daemon=True,
-    ).start()
+    threading.Thread(target=_execute_topdown_sync_worker, args=(shared_store, is_morning_big), daemon=True).start()
 
 
 # ==============================================================================
-# PURE LIQUIDITY SETUP DETECTOR (5M YELLOW BOX SWEEP & RECLAIM)
+# V10.5 5-GATE PURE LIQUIDITY DETECTOR (5M CLEAN EXECUTION — NO MICRO-NOISE)
 # ==============================================================================
-def _check_yellow_box_reclaim(m5: pd.DataFrame, pivot: float, action: str, tol: float = ZONE_BUFFER_PTS):
-    if len(m5) < 3:
+def _check_strict_yellow_box(m5: pd.DataFrame, pivot: float, action: str, max_overshoot: float):
+    """Strict 5-Gate check: Clean Approach (>=2/4 prior closes inside) + Genuine Pierce (>=1.5 pts) + Crisp Reclaim."""
+    if len(m5) < 6:
         return False, 0.0, ""
-    c1, c2 = m5.iloc[-1], m5.iloc[-2]
+    c1 = m5.iloc[-1]
     o1, h1, l1, cl1 = float(c1["o"]), float(c1["h"]), float(c1["l"]), float(c1["c"])
-    o2, h2, l2, cl2 = float(c2["o"]), float(c2["h"]), float(c2["l"]), float(c2["c"])
-    rng1 = max(h1 - l1, 1.0)
+    rng1 = h1 - l1
+    if rng1 < MIN_RNG_5M_PTS:
+        return False, 0.0, ""
     up_w1 = (h1 - max(o1, cl1)) / rng1
     dn_w1 = (min(o1, cl1) - l1) / rng1
+    body_r = abs(cl1 - o1) / rng1
+    prev4_c = m5["c"].iloc[-5:-1].values
 
     if action == "BUY_CE":
-        if up_w1 > 0.38 and cl1 < h1 - rng1 * 0.35:
+        if int(np.sum(prev4_c > pivot)) < 2:
             return False, 0.0, ""
-        if l1 <= pivot + tol and cl1 > pivot and (cl1 > o1 or dn_w1 >= 0.45):
-            return True, l1, f"1-Bar Yellow Box Sweep ({l1:.2f} <= {pivot:.2f}) & Reclaim ({cl1:.2f})"
-        low_2c = min(l1, l2)
-        if low_2c <= pivot + tol and cl1 > o1 and cl1 > pivot and cl1 >= max(o2, cl2) - 3.0:
-            return True, low_2c, f"2-Bar Yellow Box Sweep ({low_2c:.2f} <= {pivot:.2f}) & Reclaim ({cl1:.2f})"
-
+        pierce = pivot - l1
+        if MIN_PIERCE_PTS <= pierce <= max_overshoot and cl1 > pivot and up_w1 <= 0.35 and (dn_w1 >= 0.32 or (cl1 > o1 and body_r >= 0.35)):
+            return True, l1, f"Yellow Box Sweep ({l1:.2f} < {pivot:.2f}, -{pierce:.1f} pts) & Reclaim ({cl1:.2f})"
     elif action == "BUY_PE":
-        if dn_w1 > 0.38 and cl1 > l1 + rng1 * 0.35:
+        if int(np.sum(prev4_c < pivot)) < 2:
             return False, 0.0, ""
-        if h1 >= pivot - tol and cl1 < pivot and (cl1 < o1 or up_w1 >= 0.45):
-            return True, h1, f"1-Bar Yellow Box Sweep ({h1:.2f} >= {pivot:.2f}) & Reject ({cl1:.2f})"
-        high_2c = max(h1, h2)
-        if high_2c >= pivot - tol and cl1 < o1 and cl1 < pivot and cl1 <= min(o2, cl2) + 3.0:
-            return True, high_2c, f"2-Bar Yellow Box Sweep ({high_2c:.2f} >= {pivot:.2f}) & Reject ({cl1:.2f})"
-
+        pierce = h1 - pivot
+        if MIN_PIERCE_PTS <= pierce <= max_overshoot and cl1 < pivot and dn_w1 <= 0.35 and (up_w1 >= 0.32 or (cl1 < o1 and body_r >= 0.35)):
+            return True, h1, f"Yellow Box Sweep ({h1:.2f} > {pivot:.2f}, +{pierce:.1f} pts) & Reject ({cl1:.2f})"
     return False, 0.0, ""
 
 
-def detect_nifty_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones: list, regime: str, state: NiftyState, close_ts: datetime):
+def detect_nifty_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones: list, regime: str, disp_15m: str, state: NiftyState, close_ts: datetime):
     ltp = float(m5["c"].iloc[-1])
     sc = _median_range(m5, 20)
     o1, h1, l1, cl1 = float(m5["o"].iloc[-1]), float(m5["h"].iloc[-1]), float(m5["l"].iloc[-1]), ltp
-    rng1 = max(h1 - l1, 1.0)
+    rng1 = h1 - l1
+    if rng1 < MIN_RNG_5M_PTS or rng1 > MAX_RNG_MULT * sc:
+        return None
+
     up_w1 = (h1 - max(o1, cl1)) / rng1
     dn_w1 = (min(o1, cl1) - l1) / rng1
+    body_r = abs(cl1 - o1) / rng1
+    max_ov = min(MAX_OVERSHOOT_PTS, 2.2 * sc)
 
-    # Point #10 Exhaustion Momentum Check
     c_tail = m5.iloc[-4:-1]
     prev_bar = m5.iloc[-2]
-    big_up_in = (int((c_tail["c"] > c_tail["o"]).sum()) == 3) or ((float(prev_bar["c"]) - float(prev_bar["o"])) >= 2.2 * sc)
-    big_dn_in = (int((c_tail["c"] < c_tail["o"]).sum()) == 3) or ((float(prev_bar["o"]) - float(prev_bar["c"])) >= 2.2 * sc)
+    big_up_in = (int((c_tail["c"] > c_tail["o"]).sum()) == 3) or ((float(prev_bar["c"]) - float(prev_bar["o"])) >= 2.0 * sc)
+    big_dn_in = (int((c_tail["c"] < c_tail["o"]).sum()) == 3) or ((float(prev_bar["o"]) - float(prev_bar["c"])) >= 2.0 * sc)
 
-    # 1. Persistent Old / HTF Blue Boxes + Multi-Touch Shelf + Point #10 Exhaustion Trap + Current-Day Dynamic Zones
+    # 1. Persistent HTF / 15M Blue Boxes + Multi-Touch Shelf + Point #10 (Major only) + Breakout Flip Hunt
     for b in zones:
         zid = b["id"]
         if state.is_spent(zid):
@@ -805,29 +788,42 @@ def detect_nifty_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones
         if abs(lvl - ltp) > 4.0 * sc:
             continue
         action = "BUY_PE" if b["type"] == "RESISTANCE" else "BUY_CE"
-        is_major = (b.get("tf") in ("1D_BLUE_BOX", "1H_BLUE_BOX", "HIST_1D", "HIST_1W")) or (b.get("age_days", 0) >= 5) or (b.get("touches", 1) >= 2)
-        if not is_major and ((action == "BUY_PE" and regime == "TRENDING_BULL") or (action == "BUY_CE" and regime == "TRENDING_BEAR")):
+
+        if (action == "BUY_PE" and disp_15m == "TRENDING_BULL") or (action == "BUY_CE" and disp_15m == "TRENDING_BEAR"):
             continue
 
-        ok, ext, desc = _check_yellow_box_reclaim(m5, lvl, action, tol=ZONE_BUFFER_PTS)
-        if ok:
-            state.mark_spent(zid)
-            if (action == "BUY_PE" and big_up_in) or (action == "BUY_CE" and big_dn_in):
-                sname = "EXHAUSTION_TRAP_PT10"
-            elif b.get("touches", 1) >= 2:
-                sname = "MULTI_TOUCH_SHELF"
-            elif b.get("source") == "CURRENT_DAY_DYNAMIC" or b.get("tf") in ("CURRENT_DAY_5M", "CURR_DAY"):
-                sname = "CURRENT_DAY_DYNAMIC_ZONE"
-            else:
-                sname = f"OLD_{b['tf']}" if b.get("age_days", 0) >= 5 else b["tf"]
+        if b.get("flipped"):
+            if (action == "BUY_CE" and regime != "TRENDING_BULL") or (action == "BUY_PE" and regime != "TRENDING_BEAR"):
+                continue
+            ok, ext, desc = _check_strict_yellow_box(m5, lvl, action, max_ov)
+            if ok:
+                return {
+                    "name": "BREAKOUT_FLIP_HUNT", "action": action, "zone_id": zid, "blue_box": lvl,
+                    "wick_extreme": round(ext, 2), "entry": ltp,
+                    "reason": f"Broken {b['tf']} Polarity Flip Retest — {desc}"
+                }
+        else:
+            is_mega = b.get("tf") in ("1D_BLUE_BOX", "HIST_1D", "HIST_1W")
+            if not is_mega and ((action == "BUY_PE" and regime == "TRENDING_BULL") or (action == "BUY_CE" and regime == "TRENDING_BEAR")):
+                continue
 
-            return {
-                "name": sname, "action": action, "zone_id": zid, "blue_box": lvl,
-                "wick_extreme": round(ext, 2), "entry": ltp,
-                "reason": f"{desc} | {b.get('why', '')} [Touches:{b.get('touches', 1)}, Age:{b.get('age_days', 0)}d]"
-            }
+            ok, ext, desc = _check_strict_yellow_box(m5, lvl, action, max_ov)
+            if ok:
+                is_major_pt10 = (b.get("tf") in ("1D_BLUE_BOX", "1H_BLUE_BOX")) or (b.get("touches", 1) >= 2)
+                if is_major_pt10 and ((action == "BUY_PE" and big_up_in and up_w1 >= 0.35) or (action == "BUY_CE" and big_dn_in and dn_w1 >= 0.35)):
+                    sname = "EXHAUSTION_TRAP_PT10"
+                elif b.get("touches", 1) >= 2:
+                    sname = "MULTI_TOUCH_SHELF"
+                else:
+                    sname = f"OLD_{b['tf']}" if b.get("age_days", 0) >= 5 else b["tf"]
 
-    # 2. Today's 1ST_15M Liquidity Pool (09:15-09:30 High/Low)
+                return {
+                    "name": sname, "action": action, "zone_id": zid, "blue_box": lvl,
+                    "wick_extreme": round(ext, 2), "entry": ltp,
+                    "reason": f"{desc} | {b.get('why', '')} [Touches:{b.get('touches', 1)}, Age:{b.get('age_days', 0)}d]"
+                }
+
+    # 2. Today's 1ST_15M Liquidity Pool (09:15-09:30 High/Low — NIFTY #1 Winner)
     mn = close_ts.hour * 60 + close_ts.minute
     if mn >= 9 * 60 + 35 and m15 is not None and not m15.empty:
         today_str = close_ts.strftime("%Y-%m-%d")
@@ -838,81 +834,57 @@ def detect_nifty_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones
                 zid = f"1ST15M_{today_str}_{tag}"
                 if state.is_spent(zid):
                     continue
-                if (act == "BUY_PE" and regime == "TRENDING_BULL") or (act == "BUY_CE" and regime == "TRENDING_BEAR"):
+                if (act == "BUY_PE" and (regime == "TRENDING_BULL" or disp_15m == "TRENDING_BULL")) or (act == "BUY_CE" and (regime == "TRENDING_BEAR" or disp_15m == "TRENDING_BEAR")):
                     continue
-                ok, ext, desc = _check_yellow_box_reclaim(m5, lvl, act, tol=2.0)
+                ok, ext, desc = _check_strict_yellow_box(m5, lvl, act, max_ov)
                 if ok:
-                    state.mark_spent(zid)
                     return {
                         "name": "1ST_15M_LIQ_POOL", "action": act, "zone_id": zid, "blue_box": lvl,
                         "wick_extreme": round(ext, 2), "entry": ltp,
                         "reason": f"Day's 1st 15M ({lvl:.2f}) — {desc}"
                     }
 
-    # 3. Trend Pullback Liquidity Hunt (Pure HH+HL / LH+LL Structure — NO EMAs)
+    # 3. 5M Trend Pullback Liquidity Hunt (Strict Pierce + Clean Impulse)
     if len(m5) >= 16:
-        hh5 = m5["h"].values
-        ll5 = m5["l"].values
+        hh5, ll5 = m5["h"].values, m5["l"].values
         i = len(m5) - 1
         if regime == "TRENDING_BULL":
             pb_idx = i - 6 + int(np.argmin(ll5[i - 6 : i - 1]))
             pb_low = float(ll5[pb_idx])
             imp_h = float(np.max(hh5[max(0, pb_idx - 8) : pb_idx]))
+            pierce = pb_low - l1
             if (imp_h - pb_low) >= 1.2 * sc and pb_low > float(np.min(ll5[max(0, pb_idx - 12) : pb_idx])):
-                if l1 < pb_low and cl1 > pb_low and cl1 > o1 and (dn_w1 >= 0.25 or (cl1 - o1) >= 0.4 * sc):
+                if MIN_PIERCE_PTS <= pierce <= max_ov and cl1 > pb_low and cl1 > o1 and up_w1 <= 0.35 and (dn_w1 >= 0.25 or body_r >= 0.38):
                     return {
-                        "name": "TREND_PULLBACK_LIQ_HUNT", "action": "BUY_CE", "zone_id": f"TPB_L_{int(pb_low)}_{i}",
-                        "blue_box": pb_low, "wick_extreme": round(l1, 2), "entry": ltp,
-                        "reason": f"Bullish Impulse Pullback Sweep below {pb_low:.2f} (Wick {l1:.2f}) & Green Reclaim ({cl1:.2f})"
+                        "name": "TREND_PULLBACK_LIQ_HUNT", "action": "BUY_CE", "zone_id": "",
+                        "blue_box": round(pb_low, 2), "wick_extreme": round(l1, 2), "entry": ltp,
+                        "reason": f"Bullish Pullback Sweep below {pb_low:.2f} (Wick {l1:.2f}, -{pierce:.1f} pts) & Green Reclaim ({cl1:.2f})"
                     }
         elif regime == "TRENDING_BEAR":
             pb_idx = i - 6 + int(np.argmax(hh5[i - 6 : i - 1]))
             pb_high = float(hh5[pb_idx])
             imp_l = float(np.min(ll5[max(0, pb_idx - 8) : pb_idx]))
+            pierce = h1 - pb_high
             if (pb_high - imp_l) >= 1.2 * sc and pb_high < float(np.max(hh5[max(0, pb_idx - 12) : pb_idx])):
-                if h1 > pb_high and cl1 < pb_high and cl1 < o1 and (up_w1 >= 0.25 or (o1 - cl1) >= 0.4 * sc):
+                if MIN_PIERCE_PTS <= pierce <= max_ov and cl1 < pb_high and cl1 < o1 and dn_w1 <= 0.35 and (up_w1 >= 0.25 or body_r >= 0.38):
                     return {
-                        "name": "TREND_PULLBACK_LIQ_HUNT", "action": "BUY_PE", "zone_id": f"TPB_H_{int(pb_high)}_{i}",
-                        "blue_box": pb_high, "wick_extreme": round(h1, 2), "entry": ltp,
-                        "reason": f"Bearish Impulse Pullback Sweep above {pb_high:.2f} (Wick {h1:.2f}) & Red Reclaim ({cl1:.2f})"
-                    }
-
-    # 4. Dual-Side Liquidity Hunt (Point #7 & #8)
-    today_str = close_ts.strftime("%Y-%m-%d")
-    same_day = m5[m5["ts"].dt.strftime("%Y-%m-%d") == today_str]
-    if len(same_day) >= 17:
-        box, mid_bars = same_day.iloc[-17:-5], same_day.iloc[-5:-1]
-        bh, bl = float(box["h"].max()), float(box["l"].min())
-        if 18.0 <= (bh - bl) <= 65.0:
-            if float(mid_bars["h"].max()) > bh and float(mid_bars["l"].min()) >= bl and regime != "TRENDING_BEAR":
-                ok, ext, desc = _check_yellow_box_reclaim(m5, bl, "BUY_CE", tol=2.0)
-                if ok:
-                    return {
-                        "name": "DUAL_SIDE_HUNT_PT7", "action": "BUY_CE", "zone_id": f"DUAL_L_{int(bl)}",
-                        "blue_box": bl, "wick_extreme": round(ext, 2), "entry": ltp,
-                        "reason": f"Dual-Side Hunt: Swept High ({bh:.2f}) first, then Low ({bl:.2f}) -> {desc}"
-                    }
-            elif float(mid_bars["l"].min()) < bl and float(mid_bars["h"].max()) <= bh and regime != "TRENDING_BULL":
-                ok, ext, desc = _check_yellow_box_reclaim(m5, bh, "BUY_PE", tol=2.0)
-                if ok:
-                    return {
-                        "name": "DUAL_SIDE_HUNT_PT7", "action": "BUY_PE", "zone_id": f"DUAL_H_{int(bh)}",
-                        "blue_box": bh, "wick_extreme": round(ext, 2), "entry": ltp,
-                        "reason": f"Dual-Side Hunt: Swept Low ({bl:.2f}) first, then High ({bh:.2f}) -> {desc}"
+                        "name": "TREND_PULLBACK_LIQ_HUNT", "action": "BUY_PE", "zone_id": "",
+                        "blue_box": round(pb_high, 2), "wick_extreme": round(h1, 2), "entry": ltp,
+                        "reason": f"Bearish Pullback Sweep above {pb_high:.2f} (Wick {h1:.2f}, +{pierce:.1f} pts) & Red Reclaim ({cl1:.2f})"
                     }
 
     return None
 
 
 # ==============================================================================
-# PARALLEL NON-BLOCKING BACKGROUND AI CONFIRMATION
+# PARALLEL NON-BLOCKING BACKGROUND AI CONFIRMATION (REAL OHLC — ZERO HALLUCINATION)
 # ==============================================================================
 LIVE_CONFIRM_SYS_PROMPT = (
-    "You are the NIFTY 50 Institutional Pure Liquidity Supervisor (Zero Indicators).\n"
-    "Python already fired a fast 5M Yellow Box sweep alert. Perform an independent price-action audit.\n"
-    "Decode delta candles using Base Price. Check wick quality, zone authenticity, and opposing walls.\n"
+    "You are the NIFTY 50 Institutional Pure Price-Action Supervisor (Zero Indicators, No Orderflow/Volume Delta).\n"
+    "All candle prices provided below are ACTUAL OHLC Index prices.\n"
+    "Audit the 5M liquidity sweep & reclaim quality, wick rejection strength, trend alignment, and nearby opposing walls.\n"
     "Respond ONLY in strictly valid JSON:\n"
-    '{"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 concise sentences"}'
+    '{"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 concise pure price-action sentences"}'
 )
 
 
@@ -934,12 +906,12 @@ def _background_ai_confirm_worker(setup: dict, usr_p: str, signal_time: str):
 
 
 # ==============================================================================
-# DIAGNOSTICS & DAILY 09:03-09:10 IST HEALTH AUDIT
+# DIAGNOSTICS & DAILY 09:03-09:10 IST HEALTH AUDIT (WEEKEND-SAFE days_back=5)
 # ==============================================================================
 def run_startup_diagnostics(shared_store=None) -> dict:
     log.info("[NIFTY] Running Startup Diagnostics...")
     t0 = time.time()
-    df_t = fetch_upstox_candles("minutes", 5, days_back=2, include_intraday=True, closed_only=False)
+    df_t = fetch_upstox_candles("minutes", 5, days_back=5, include_intraday=True, closed_only=False)
     api_ms = int((time.time() - t0) * 1000)
     upstox_ok = not df_t.empty
     ltp = float(df_t["c"].iloc[-1]) if upstox_ok else 0.0
@@ -958,7 +930,7 @@ def check_daily_morning_health(state: NiftyState, ltp: float):
         tg_send(
             f"☀️ <b>[NIFTY 50 DAILY HEALTH | {now.strftime('%d %b %Y %H:%M IST')}]</b>\n"
             f"• <b>Upstox V3:</b> <code>ONLINE</code> | <b>Last Close:</b> <code>{ltp:.2f}</code>\n"
-            f"• <b>Active Blue Boxes:</b> <code>{len(zones)}</code> | <b>Regime:</b> <code>{regime}</code>\n"
+            f"• <b>Valid Blue Boxes:</b> <code>{len(zones)}</code> | <b>Regime:</b> <code>{regime}</code>\n"
             f"• <b>AI Calls Today:</b> <code>{_daily_ai_calls}</code>"
         )
 
@@ -971,13 +943,12 @@ def run_nifty_cycle(shared_store=None):
         return
     try:
         state = NiftyState(shared_store)
-        now = datetime.now(IST)
 
         # 1. Trigger 09:20 BIG Analysis or Hourly Sync (10:20 - 14:20 IST)
         trigger_topdown_if_due(shared_store, force=False)
 
-        # 2. Fetch closed 5M & 15M candles
-        df_5m = fetch_upstox_candles("minutes", 5, days_back=4, include_intraday=True, closed_only=True)
+        # 2. Fetch closed 5M candles (days_back=5 handles weekends/holidays cleanly)
+        df_5m = fetch_upstox_candles("minutes", 5, days_back=5, include_intraday=True, closed_only=True)
         if df_5m is None or len(df_5m) < 25:
             return
 
@@ -996,44 +967,60 @@ def run_nifty_cycle(shared_store=None):
         if mn < 9 * 60 + 25 or mn > 14 * 60 + 30:
             return
 
-        df_15m = fetch_upstox_candles("minutes", 15, days_back=6, include_intraday=True, closed_only=True)
-        df_1h = fetch_upstox_candles("hours", 1, days_back=15, include_intraday=True, closed_only=True)
+        df_15m = fetch_upstox_candles("minutes", 15, days_back=10, include_intraday=True, closed_only=True)
+        df_1h = fetch_upstox_candles("hours", 1, days_back=20, include_intraday=True, closed_only=True)
 
-        regime = state.get("regime") or get_pure_pa_regime(df_1h)
+        # Live Dynamic PA Regime (never stale)
+        live_regime, disp_15m = get_live_pa_regime(df_1h, df_15m)
+        ai_reg = state.get("ai_regime")
+        regime = live_regime if (live_regime != "SIDEWAYS" or not ai_reg) else ai_reg
+        state.set("regime", regime, ttl=7200)
+
+        # Refresh valid zones & purge/flip broken zones every 5M bar
         cached_htf = state.get("active_zones") or []
         live_zones = extract_pure_blue_boxes(None, df_1h, df_15m, df_5m, ltp, close_ts, state)
-        # Merge cached 1D/AI zones with freshly updated 1H/15M/Current-Day dynamic zones
         zones = list(live_zones)
         for cz in cached_htf:
-            if not state.is_spent(cz["id"]) and not any(x["type"] == cz["type"] and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_PTS for x in zones):
-                zones.append(cz)
-        state.set("active_zones", zones[:25], ttl=21600)
+            if not state.is_spent(cz["id"]):
+                st = _update_or_purge_zone(cz, df_5m, ltp)
+                if st == "PURGE":
+                    state.mark_spent(cz["id"])
+                    continue
+                if st == "FLIP":
+                    cz = dict(cz)
+                    cz["type"] = "SUPPORT" if cz["type"] == "RESISTANCE" else "RESISTANCE"
+                    cz["flipped"] = True
+                if not any(x["type"] == cz["type"] and x.get("flipped") == cz.get("flipped") and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_PTS for x in zones):
+                    zones.append(cz)
+        state.set("active_zones", zones[:20], ttl=21600)
 
-        # 3. Check Zone Vacuum (< 2 zones in LTP ± 300 pts) -> Dynamic 3-Yr Band Slice / New High Fallback
-        check_zone_vacuum_and_trigger_band(state, zones, ltp, df_5m)
+        # 3. Zone Vacuum Check (< 2 zones in LTP ± 300 pts) -> 3-Yr Band Slice
+        check_zone_vacuum_and_trigger_band(state, zones, ltp, df_15m)
 
-        # 4. Evaluate Pure Liquidity Setups (0-Lag Python)
-        setup = detect_nifty_pure_liquidity_setup(df_5m, df_15m, zones, regime, state, close_ts)
+        # 4. Evaluate 5-Gate Pure Liquidity Setups
+        setup = detect_nifty_pure_liquidity_setup(df_5m, df_15m, zones, regime, disp_15m, state, close_ts)
         if not setup:
-            log.info(f"[NIFTY] {close_ts.strftime('%H:%M IST')} | LTP:{ltp:.2f} | Regime:{regime} | Zones:{len(zones)} -> WAITING")
+            log.info(f"[NIFTY] {close_ts.strftime('%H:%M IST')} | LTP:{ltp:.2f} | Regime:{regime} | ValidZones:{len(zones)} -> WAITING")
             return
 
-        # Cooldown & opposite-direction collision guard
+        # Gate 5: Check cooldowns & opposite lock BEFORE marking zone spent!
         last_dir = state.get("last_sig_dir")
         last_dir_t = state.get("last_sig_ts") or 0
         if last_dir and last_dir != setup["action"] and (time.time() - last_dir_t) < OPPOSITE_LOCK_MIN * 60:
-            log.info(f"[NIFTY] Opposite lock active ({last_dir}); skipped {setup['action']}.")
+            log.info(f"[NIFTY] Opposite lock active ({last_dir}); skipped {setup['action']} without spending zone.")
             return
 
         cd_key = f"cd_{setup['name']}_{setup['action']}"
         if state.get(cd_key):
             return
 
+        if setup.get("zone_id"):
+            state.mark_spent(setup["zone_id"])
         state.set("last_sig_dir", setup["action"], ttl=OPPOSITE_LOCK_MIN * 60)
         state.set("last_sig_ts", time.time(), ttl=OPPOSITE_LOCK_MIN * 60)
         state.set(cd_key, True, ttl=SETUP_COOLDOWN_MIN * 60)
 
-        # 5. PYTHON-FIRST INSTANT TELEGRAM ALERT (Entry-Only, Manual SL/Target)
+        # 5. PYTHON-FIRST INSTANT TELEGRAM ALERT
         em = "🟢" if setup["action"] == "BUY_CE" else "🔴"
         sig_time_str = close_ts.strftime("%H:%M IST")
         msg = (
@@ -1041,27 +1028,22 @@ def run_nifty_cycle(shared_store=None):
             f"⚡ <b>Setup        :</b> <code>{esc(setup['name'])}</code>\n"
             f"🎯 <b>Index Entry  :</b> <b>{setup['entry']:.2f}</b>\n"
             f"🟦 <b>Blue Box Lvl :</b> <b>{setup['blue_box']:.2f}</b> | <b>Yellow Wick Ext:</b> <b>{setup['wick_extreme']:.2f}</b>\n"
-            f"🧭 <b>PA Regime    :</b> <code>{esc(regime)}</code>\n"
+            f"🧭 <b>Live Regime  :</b> <code>{esc(regime)}</code>\n"
             f"📝 <b>Sweep Logic  :</b> {esc(setup['reason'])}\n\n"
             f"⏳ <i>Chart baghun manual confirm kar (Manual SL &amp; Target mode). Running parallel AI audit...</i>"
         )
         tg_send(msg)
-        log.info(f"[NIFTY] 🔥 INSTANT ALERT: {setup['name']} ({setup['action']}) @ {setup['entry']:.2f}")
+        log.info(f"[NIFTY] 🔥 QUALITY ALERT: {setup['name']} ({setup['action']}) @ {setup['entry']:.2f}")
 
-        # 6. Parallel Non-Blocking Background AI Audit
-        base_p = int(math.floor(ltp / 500.0) * 500)
-        delta_bars = encode_delta_candles(df_5m, 45, base_p, "%m-%d %H:%M")
+        # 6. Parallel Background AI Audit with REAL OHLC (No "Delta" word)
         usr_p = (
             f"Asset: NIFTY 50 | Time: {sig_time_str} | Entry: {setup['entry']:.2f}\n"
             f"Setup: {setup['name']} ({setup['action']}) | Blue Box: {setup['blue_box']:.2f} | Wick Ext: {setup['wick_extreme']:.2f}\n"
-            f"Regime: {regime} | Reason: {setup['reason']}\n"
-            f"Base Price: {base_p} | Recent 45 5M Delta Candles: {delta_bars}"
+            f"Live Regime: {regime} | Reason: {setup['reason']}\n"
+            f"Recent 16 15M Real OHLC Candles:\n" + "\n".join(format_ohlc_candles(df_15m, 16)) + "\n"
+            f"Recent 28 5M Real OHLC Candles:\n" + "\n".join(format_ohlc_candles(df_5m, 28))
         )
-        threading.Thread(
-            target=_background_ai_confirm_worker,
-            args=(setup, usr_p, sig_time_str),
-            daemon=True,
-        ).start()
+        threading.Thread(target=_background_ai_confirm_worker, args=(setup, usr_p, sig_time_str), daemon=True).start()
 
     except Exception as e:
         log.exception(f"[NIFTY] Cycle error: {type(e).__name__}")
