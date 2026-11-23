@@ -199,7 +199,8 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
     if not GEMINI_API_KEYS:
         return None
 
-    attempts = max(2, len(GEMINI_API_KEYS) * 2)
+    attempts = max(2, len(GEMINI_API_KEYS))
+    srv_503_hits = 0
     for attempt in range(attempts):
         with _ai_rate_lock:
             wait = 2.2 - (time.time() - _last_gemini_call)
@@ -241,10 +242,13 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
                 time.sleep(backoff)
                 continue
             if r.status_code in (500, 502, 503, 504):
-                backoff = min(6.0, 1.5 + attempt * 1.5)
-                log.warning(f"[BTC] {model_name} HTTP {r.status_code} — retrying in {backoff:.1f}s...")
-                time.sleep(backoff)
-                continue
+                srv_503_hits += 1
+                if srv_503_hits <= 1:
+                    log.warning(f"[BTC] {model_name} HTTP {r.status_code} — quick 1.5s retry...")
+                    time.sleep(1.5)
+                    continue
+                log.warning(f"[BTC] {model_name} HTTP {r.status_code} — falling back to next model...")
+                break
             if r.status_code == 200:
                 cands = r.json().get("candidates", [])
                 if cands:
