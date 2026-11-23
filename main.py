@@ -1,6 +1,6 @@
 """
 ================================================================================
-UNIFIED MULTI-ASSET PURE LIQUIDITY ORCHESTRATOR — PRODUCTION V10.0
+UNIFIED MULTI-ASSET PURE LIQUIDITY ORCHESTRATOR — PRODUCTION V10.5
 Assets: NIFTY 50 (Upstox V3) + GOLD XAUTUSD (Delta) + BITCOIN BTCUSD (Delta)
 ================================================================================
 CORE FEATURES:
@@ -174,12 +174,22 @@ def tg_broadcast(text: str):
 # KOYEB / UPTIMEROBOT 24/7 HTTP HEALTH SERVER
 # ==============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    protocol_version = "HTTP/1.1"
+
+    def _send_ok_headers(self, ctype: str, length: int):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _handle_any(self, send_body: bool = True):
         uptime_min = int((time.time() - _boot_ts) / 60)
-        if self.path == "/status":
+        clean_path = (self.path or "/").split("?")[0]
+        if clean_path == "/status":
             payload = {
                 "status": "ONLINE",
-                "engine": "Pure Liquidity Multi-Asset V10.0",
+                "engine": "Pure Liquidity Multi-Asset V10.5",
                 "boot_time_ist": _boot_time_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
                 "uptime_minutes": uptime_min,
                 "store_backend": shared_store.backend_name,
@@ -188,15 +198,30 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "btc_zones": len(shared_store.get("BTC:active_zones") or []),
             }
             body = json.dumps(payload, indent=2).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_ok_headers("application/json; charset=utf-8", len(body))
+            if send_body:
+                self.wfile.write(body)
         else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(f"OK - Pure Liquidity V10.0 Active | Uptime: {uptime_min}m\n".encode("utf-8"))
+            body = f"OK - Pure Liquidity V10.5 Active | Uptime: {uptime_min}m\n".encode("utf-8")
+            self._send_ok_headers("text/plain; charset=utf-8", len(body))
+            if send_body:
+                self.wfile.write(body)
+        self.close_connection = True
+
+    def do_GET(self):
+        self._handle_any(send_body=True)
+
+    def do_HEAD(self):
+        self._handle_any(send_body=False)
+
+    def do_POST(self):
+        try:
+            cl = int(self.headers.get("Content-Length", "0"))
+            if cl > 0:
+                self.rfile.read(min(cl, 65536))
+        except Exception:
+            pass
+        self._handle_any(send_body=True)
 
     def log_message(self, format, *args):
         return
@@ -254,7 +279,7 @@ def run_first_5min_startup_diagnostics():
     b_str = f"ONLINE (${btc_diag['ltp']:,.1f} | {btc_diag['api_ms']}ms)" if btc_diag["api_ok"] else "OFFLINE"
 
     report = (
-        f"🚀 <b>[PURE LIQUIDITY ENGINE V10.0 — STARTUP VERIFIED]</b>\n"
+        f"🚀 <b>[PURE LIQUIDITY ENGINE V10.5 — STARTUP VERIFIED]</b>\n"
         f"📅 <b>Boot Time:</b> <code>{now.strftime('%Y-%m-%d %H:%M:%S IST')}</code>\n"
         f"🗄️ <b>State Store:</b> <code>{shared_store.backend_name} (NIFTY:* | GOLD:* | BTC:*)</code>\n\n"
         f"📡 <b>Market Data APIs:</b>\n"
@@ -308,7 +333,7 @@ def _sleep_until_next_05s():
 
 
 def main():
-    log.info("[MAIN] Starting Pure Liquidity Multi-Asset Orchestrator V10.0...")
+    log.info("[MAIN] Starting Pure Liquidity Multi-Asset Orchestrator V10.5...")
 
     # Start 24/7 HTTP health server for Koyeb / UptimeRobot
     threading.Thread(target=start_http_server, daemon=True).start()
