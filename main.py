@@ -264,10 +264,13 @@ def run_first_5min_startup_diagnostics():
     log.info("[MAIN] 🔍 Executing First-5-Minute Startup API & Model Diagnostic Suite...")
     now = datetime.now(IST)
 
-    # 1. Test Data APIs + trigger initial Top-Down / 6H Zone Syncs
-    nifty_diag = nifty50.run_startup_diagnostics(shared_store) if ENABLE_NIFTY else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
-    gold_diag = gold.run_startup_diagnostics(shared_store) if ENABLE_GOLD else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
-    btc_diag = bitcoin.run_startup_diagnostics(shared_store) if ENABLE_BTC else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    # 1. Test Data APIs + trigger initial Top-Down / 6H Zone Syncs (staggered to avoid burst 429/503)
+    nifty_diag = nifty50.run_startup_diagnostics(shared_store) if (ENABLE_NIFTY and hasattr(nifty50, "run_startup_diagnostics")) else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    time.sleep(1.5)
+    gold_diag = gold.run_startup_diagnostics(shared_store) if (ENABLE_GOLD and hasattr(gold, "run_startup_diagnostics")) else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    time.sleep(1.5)
+    btc_diag = bitcoin.run_startup_diagnostics(shared_store) if (ENABLE_BTC and hasattr(bitcoin, "run_startup_diagnostics")) else {"api_ok": False, "ltp": 0.0, "api_ms": 0}
+    time.sleep(1.5)
 
     # 2. Test all 3 Gemini AI Models
     m_hydro = _ping_gemini_model(HYDROGEN_MODEL, "HIGH")
@@ -349,16 +352,30 @@ def main():
             # Consolidated Morning Health Check (09:03 - 09:10 IST)
             check_consolidated_morning_health()
 
-            # Launch enabled market engines in parallel non-blocking daemon threads
+            # Launch enabled market engines in parallel non-blocking daemon threads (with safe attribute guards)
             if ENABLE_NIFTY:
-                threading.Thread(target=nifty50.run_nifty_cycle, args=(shared_store,), daemon=True).start()
+                fn_n = getattr(nifty50, "run_nifty_cycle", None)
+                if callable(fn_n):
+                    threading.Thread(target=fn_n, args=(shared_store,), daemon=True).start()
+                else:
+                    log.error("[MAIN] nifty_bot.py is missing run_nifty_cycle() — check GitHub file contents!")
+
             if ENABLE_GOLD:
-                threading.Thread(target=gold.run_gold_cycle, args=(shared_store,), daemon=True).start()
+                fn_g = getattr(gold, "run_gold_cycle", None)
+                if callable(fn_g):
+                    threading.Thread(target=fn_g, args=(shared_store,), daemon=True).start()
+                else:
+                    log.error("[MAIN] gold_bot.py is missing run_gold_cycle() — check GitHub gold_bot.py (may have btc_bot code pasted)!")
+
             if ENABLE_BTC:
-                threading.Thread(target=bitcoin.run_btc_cycle, args=(shared_store,), daemon=True).start()
+                fn_b = getattr(bitcoin, "run_btc_cycle", None)
+                if callable(fn_b):
+                    threading.Thread(target=fn_b, args=(shared_store,), daemon=True).start()
+                else:
+                    log.error("[MAIN] btc_bot.py is missing run_btc_cycle() — check GitHub file contents!")
 
         except Exception as e:
-            log.error(f"[MAIN] Loop error: {type(e).__name__}")
+            log.exception(f"[MAIN] Loop error: {type(e).__name__}: {e}")
             time.sleep(5)
 
 
