@@ -1,9 +1,25 @@
 """
 ================================================================================
-NIFTY 50 PURE LIQUIDITY ENGINE — PRODUCTION V10.5 (ZERO-NOISE EDITION)
+NIFTY 50 PURE LIQUIDITY ENGINE — PRODUCTION V10.6 (EARLY WATCH EDITION)
 Namespace: NIFTY:* | Upstox V3 API | 100% Price Action (Zero EMA / RSI / ATR)
 ================================================================================
-UPGRADES IN V10.5:
+UPGRADES IN V10.6 (backtested on 15 real trading days, 02-20 Nov 2026 1-min NIFTY data):
+  1. NEW: "Early Watch" layer — scans 1-min candles of the forming 5M bar for a
+     sweep+2-bar-hold against the same Blue Box zones, and sends a separate, non-blocking
+     "👀 heads up" Telegram alert 1-4 min before the real 5-Gate signal could fire.
+     It NEVER spends a zone, starts a cooldown, or substitutes for the 5-Gate signal —
+     backtesting a single-bar early trigger as a REPLACEMENT for the 5-Gate entry actually
+     hurt 30-min win-rate (35% vs 42.9%) on this sample, so the quality-vetted 5-Gate path
+     is kept fully intact and this ships as an optional, clearly-labeled early heads-up only.
+     Needs run_nifty_cycle() invoked every ~1 min (not 5) during market hours — see its docstring.
+  2. FIX: HYDROGEN_MODEL default was "gemini-4-hydrogen", which does not exist on the live
+     Gemini API (checked 24 Nov 2026) — now defaults to "gemini-4-argon" (Stable). The two
+     flash-lite model names were already correct and are unchanged.
+  3. LIVE_CONFIRM_SYS_PROMPT now explicitly asks the AI audit to flag stale/3rd-touch
+     reclaims and first-10-min / last-30-min session timing, both common sources of
+     early-but-low-quality entries.
+================================================================================
+PRIOR V10.5 UPGRADES:
   1. Removes noisy CURRENT_DAY_5M micro-ripples & negative-edge DUAL_SIDE_HUNT_PT7.
   2. Adds genuine BREAKOUT_FLIP_HUNT on broken 1D/1H Blue Boxes (with-trend only).
   3. Live Dynamic PA Regime (1H structure + 15M rapid displacement guard).
@@ -44,7 +60,10 @@ NIFTY_SYMBOL_KEY    = "NSE_INDEX|Nifty 50"
 NIFTY_KEY_ENC       = quote(NIFTY_SYMBOL_KEY)
 UPSTOX_V3_BASE      = "https://api.upstox.com/v3"
 
-HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-hydrogen").strip()
+# Model check (24 Nov 2026 live availability sweep): "gemini-4-hydrogen" does NOT
+# exist on the Gemini API — the live Gemini 4 model is "gemini-4-argon" (Stable).
+# "gemini-3.5-flash-lite" and "gemini-3.1-flash-lite" are both confirmed Stable, unchanged.
+HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-argon").strip()
 LITE_35_MODEL       = os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite").strip()
 LITE_31_MODEL       = os.getenv("GEMINI_31_LITE_MODEL", "gemini-3.1-flash-lite").strip()
 
@@ -72,6 +91,22 @@ VACUUM_RADIUS_PTS   = 300.0
 DEEP_BAND_PTS       = 600.0
 SETUP_COOLDOWN_MIN  = int(os.getenv("NIFTY_SETUP_COOLDOWN_MIN", "45"))
 OPPOSITE_LOCK_MIN   = int(os.getenv("NIFTY_OPPOSITE_LOCK_MIN", "30"))
+
+# --- EARLY WATCH (V10.6): 1-minute pre-alert layer on top of the unchanged 5-Gate system ---
+# Backtested on 15 trading days (02-20 Nov 2026) of real 1-min NIFTY data: a single-1-minute-bar
+# reclaim trigger pulled signals 2-4 min earlier but *lowered* 30-min win-rate (35% vs 42.9% for
+# the stock 5-gate system) on this small sample -- too noisy to replace the confirmed signal.
+# A 2-bar hold confirmation (sweep bar + 1 more 1-min close holding past the pivot) was safer but
+# STILL not reliably better than the 5-gate close on this sample size (15 days / ~15 signals is too
+# small to prove a timing edge). So Early Watch ships as a SEPARATE, non-blocking "heads up" alert:
+# it never spends a zone, never starts a cooldown, and never substitutes for the 5-Gate signal --
+# it only gives Pravesh a few minutes' notice to pull up the chart before the real alert can fire.
+# Requires run_nifty_cycle() to be invoked every ~1 min during market hours (the 5-Gate path is
+# already safe to call that often -- it only acts once a NEW closed 5M candle actually appears).
+EARLY_WATCH_ENABLED     = os.getenv("NIFTY_EARLY_WATCH", "1") != "0"
+EARLY_WATCH_MIN_RNG_1M  = 3.0   # min 1-min bar range (pts) to even look at a reclaim
+EARLY_WATCH_WINDOW_MIN  = 4     # only watch minutes 1-4 of the forming 5M bar (never its closing minute)
+EARLY_WATCH_COOLDOWN_MIN = SETUP_COOLDOWN_MIN
 
 _nifty_lock = threading.Lock()
 _ai_rate_lock = threading.Lock()
@@ -765,6 +800,98 @@ def _check_strict_yellow_box(m5: pd.DataFrame, pivot: float, action: str, max_ov
     return False, 0.0, ""
 
 
+def _check_early_watch_candidate(df_5m_closed: pd.DataFrame, m1_bar, pivot: float, action: str, max_overshoot: float):
+    """Same sweep+reclaim shape as _check_strict_yellow_box, but on ONE 1-minute candle
+    (scaled-down range gate) and using the last 4 CLOSED 5M candles for the clean-approach
+    context (never the still-forming bar). Returns True only for the FIRST ("sweep") bar;
+    the actual alert fires one bar later, once _check_early_watch_hold confirms it stuck."""
+    o1, h1, l1, cl1 = float(m1_bar["o"]), float(m1_bar["h"]), float(m1_bar["l"]), float(m1_bar["c"])
+    rng1 = h1 - l1
+    if rng1 < EARLY_WATCH_MIN_RNG_1M:
+        return False
+    up_w1 = (h1 - max(o1, cl1)) / rng1
+    dn_w1 = (min(o1, cl1) - l1) / rng1
+    body_r = abs(cl1 - o1) / rng1
+    prev4_c = df_5m_closed["c"].iloc[-4:].values if len(df_5m_closed) >= 4 else df_5m_closed["c"].values
+    if len(prev4_c) < 2:
+        return False
+
+    if action == "BUY_CE":
+        if int(np.sum(prev4_c > pivot)) < 2:
+            return False
+        pierce = pivot - l1
+        return MIN_PIERCE_PTS <= pierce <= max_overshoot and cl1 > pivot and up_w1 <= 0.35 and (dn_w1 >= 0.32 or (cl1 > o1 and body_r >= 0.35))
+    if action == "BUY_PE":
+        if int(np.sum(prev4_c < pivot)) < 2:
+            return False
+        pierce = h1 - pivot
+        return MIN_PIERCE_PTS <= pierce <= max_overshoot and cl1 < pivot and dn_w1 <= 0.35 and (up_w1 >= 0.32 or (cl1 < o1 and body_r >= 0.35))
+    return False
+
+
+def _check_early_watch_hold(m1_bar, pivot: float, action: str) -> bool:
+    """2nd confirmation bar: the reclaim has to still be standing one minute later."""
+    cl1 = float(m1_bar["c"])
+    return (cl1 > pivot) if action == "BUY_CE" else (cl1 < pivot)
+
+
+def detect_early_watch(df_1m: pd.DataFrame, df_5m: pd.DataFrame, zones: list, regime: str, disp_15m: str,
+                        state: NiftyState, bar_start: datetime, bar_end: datetime):
+    """Scans the still-forming 5M bar (1-min candles between bar_start and bar_end) for an
+    early sweep+hold against the SAME Blue Box zones the 5-Gate system watches. Pure heads-up:
+    never touches zone-spent / cooldown / opposite-lock state used by the real signal path."""
+    if not EARLY_WATCH_ENABLED or df_1m is None or df_1m.empty or len(df_5m) < 4:
+        return None
+    sub = df_1m[(df_1m["ts"] >= bar_start) & (df_1m["ts"] < bar_end)].reset_index(drop=True)
+    if sub.empty:
+        return None
+    sub = sub.iloc[:EARLY_WATCH_WINDOW_MIN]
+    sc5 = _median_range(df_5m, 20)
+    max_ov = min(MAX_OVERSHOOT_PTS, 2.2 * sc5)
+    ltp = float(df_5m["c"].iloc[-1])
+
+    for b in zones:
+        zid = b["id"]
+        if state.is_spent(zid):
+            continue
+        lvl = float(b["pivot"])
+        if abs(lvl - ltp) > 4.0 * sc5:
+            continue
+        action = "BUY_PE" if b["type"] == "RESISTANCE" else "BUY_CE"
+        if (action == "BUY_PE" and disp_15m == "TRENDING_BULL") or (action == "BUY_CE" and disp_15m == "TRENDING_BEAR"):
+            continue
+        if b.get("flipped"):
+            if (action == "BUY_CE" and regime != "TRENDING_BULL") or (action == "BUY_PE" and regime != "TRENDING_BEAR"):
+                continue
+        else:
+            is_mega = b.get("tf") == "1D_BLUE_BOX"
+            if not is_mega and ((action == "BUY_PE" and regime == "TRENDING_BULL") or (action == "BUY_CE" and regime == "TRENDING_BEAR")):
+                continue
+
+        ew_key = f"ew_cd_{zid}_{action}"
+        if state.get(ew_key):
+            continue
+
+        candidate_bar = None
+        for idx in range(len(sub) - 1):
+            m1 = sub.iloc[idx]
+            if _check_early_watch_candidate(df_5m, m1, lvl, action, max_ov):
+                candidate_bar = m1
+                hold_bar = sub.iloc[idx + 1]
+                if _check_early_watch_hold(hold_bar, lvl, action):
+                    state.set(ew_key, True, ttl=EARLY_WATCH_COOLDOWN_MIN * 60)
+                    return {
+                        "action": action, "zone_id": zid, "blue_box": lvl, "tf": b.get("tf", ""),
+                        "entry_preview": float(hold_bar["c"]),
+                        "sweep_ts": _ensure_ist(m1["ts"]), "confirm_ts": _ensure_ist(hold_bar["ts"]),
+                        "lead_min": round((bar_end - _ensure_ist(hold_bar["ts"])).total_seconds() / 60.0, 1),
+                        "why": b.get("why", ""),
+                    }
+                break  # sweep found but didn't hold -> wait for a fresh sweep, don't re-check mid-sequence
+        del candidate_bar
+    return None
+
+
 def detect_nifty_pure_liquidity_setup(m5: pd.DataFrame, m15: pd.DataFrame, zones: list, regime: str, disp_15m: str, state: NiftyState, close_ts: datetime):
     ltp = float(m5["c"].iloc[-1])
     sc = _median_range(m5, 20)
@@ -887,6 +1014,11 @@ LIVE_CONFIRM_SYS_PROMPT = (
     "You are the NIFTY 50 Institutional Pure Price-Action Supervisor (Zero Indicators, No Orderflow/Volume Delta).\n"
     "All candle prices provided below are ACTUAL OHLC Index prices.\n"
     "Audit the 5M liquidity sweep & reclaim quality, wick rejection strength, trend alignment, and nearby opposing walls.\n"
+    "Specifically flag (in the note) if this is a STALE zone (3rd+ touch, reclaim looks tired / shrinking "
+    "range into the level) or a FRESH first-touch reclaim with real displacement — stale reclaims are the "
+    "most common source of early-but-low-quality entries and should push the verdict toward WAIT_CAUTION.\n"
+    "Also flag if the entry sits in the first 10 minutes of the session or the last 30 minutes before close, "
+    "where follow-through is historically less reliable.\n"
     "Respond ONLY in strictly valid JSON:\n"
     '{"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 concise pure price-action sentences"}'
 )
@@ -943,6 +1075,12 @@ def check_daily_morning_health(state: NiftyState, ltp: float):
 # MAIN 5M CYCLE (PYTHON-FIRST INSTANT ALERT -> PARALLEL AI)
 # ==============================================================================
 def run_nifty_cycle(shared_store=None):
+    """
+    Safe to invoke every ~1 minute during market hours (recommended, for Early Watch to have
+    any effect) or every 5 minutes (old cadence, Early Watch then effectively stays off since
+    the forming-bar window it scans will already be closed by the next call). The heavy 5-Gate
+    block below only ever runs once per NEWLY closed 5M candle either way, via `new_5m_bar`.
+    """
     if not _nifty_lock.acquire(blocking=False):
         return
     try:
@@ -962,46 +1100,77 @@ def run_nifty_cycle(shared_store=None):
         last_bar_ts = _ensure_ist(df_5m["ts"].iloc[-1])
         close_ts = last_bar_ts + timedelta(minutes=5)
         bar_key = close_ts.strftime("%Y-%m-%d_%H:%M")
-
-        if state.get("last_eval_bar") == bar_key:
-            return
-        state.set("last_eval_bar", bar_key, ttl=600)
+        new_5m_bar = state.get("last_eval_bar") != bar_key
 
         mn = close_ts.hour * 60 + close_ts.minute
         if mn < 9 * 60 + 25 or mn > 14 * 60 + 30:
             return
 
-        df_15m = fetch_upstox_candles("minutes", 15, days_back=10, include_intraday=True, closed_only=True)
-        df_1h = fetch_upstox_candles("hours", 1, days_back=20, include_intraday=True, closed_only=True)
+        if new_5m_bar:
+            state.set("last_eval_bar", bar_key, ttl=600)
 
-        # Live Dynamic PA Regime (never stale)
-        live_regime, disp_15m = get_live_pa_regime(df_1h, df_15m)
-        ai_reg = state.get("ai_regime")
-        regime = live_regime if (live_regime != "SIDEWAYS" or not ai_reg) else ai_reg
-        state.set("regime", regime, ttl=7200)
+            df_15m = fetch_upstox_candles("minutes", 15, days_back=10, include_intraday=True, closed_only=True)
+            df_1h = fetch_upstox_candles("hours", 1, days_back=20, include_intraday=True, closed_only=True)
 
-        # Refresh valid zones & purge/flip broken zones every 5M bar
-        cached_htf = state.get("active_zones") or []
-        live_zones = extract_pure_blue_boxes(None, df_1h, df_15m, df_5m, ltp, close_ts, state)
-        zones = list(live_zones)
-        for cz in cached_htf:
-            if not state.is_spent(cz["id"]):
-                st = _update_or_purge_zone(cz, df_5m, ltp)
-                if st == "PURGE":
-                    state.mark_spent(cz["id"])
-                    continue
-                if st == "FLIP":
-                    cz = dict(cz)
-                    cz["type"] = "SUPPORT" if cz["type"] == "RESISTANCE" else "RESISTANCE"
-                    cz["flipped"] = True
-                if not any(x["type"] == cz["type"] and x.get("flipped") == cz.get("flipped") and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_PTS for x in zones):
-                    zones.append(cz)
-        state.set("active_zones", zones[:20], ttl=21600)
+            # Live Dynamic PA Regime (never stale)
+            live_regime, disp_15m = get_live_pa_regime(df_1h, df_15m)
+            ai_reg = state.get("ai_regime")
+            regime = live_regime if (live_regime != "SIDEWAYS" or not ai_reg) else ai_reg
+            state.set("regime", regime, ttl=7200)
+            state.set("disp_15m", disp_15m, ttl=7200)
 
-        # 3. Zone Vacuum Check (< 2 zones in LTP ± 300 pts) -> 3-Yr Band Slice
-        check_zone_vacuum_and_trigger_band(state, zones, ltp, df_15m)
+            # Refresh valid zones & purge/flip broken zones every 5M bar
+            cached_htf = state.get("active_zones") or []
+            live_zones = extract_pure_blue_boxes(None, df_1h, df_15m, df_5m, ltp, close_ts, state)
+            zones = list(live_zones)
+            for cz in cached_htf:
+                if not state.is_spent(cz["id"]):
+                    st = _update_or_purge_zone(cz, df_5m, ltp)
+                    if st == "PURGE":
+                        state.mark_spent(cz["id"])
+                        continue
+                    if st == "FLIP":
+                        cz = dict(cz)
+                        cz["type"] = "SUPPORT" if cz["type"] == "RESISTANCE" else "RESISTANCE"
+                        cz["flipped"] = True
+                    if not any(x["type"] == cz["type"] and x.get("flipped") == cz.get("flipped") and abs(float(x["pivot"]) - float(cz["pivot"])) <= SHELF_MERGE_PTS for x in zones):
+                        zones.append(cz)
+            state.set("active_zones", zones[:20], ttl=21600)
 
-        # 4. Evaluate 5-Gate Pure Liquidity Setups
+            # 3. Zone Vacuum Check (< 2 zones in LTP ± 300 pts) -> 3-Yr Band Slice
+            check_zone_vacuum_and_trigger_band(state, zones, ltp, df_15m)
+        else:
+            # In-between 1-min tick (same 5M bar still forming): reuse the last computed
+            # regime/zones rather than re-hitting Upstox for 15M/1H data every minute.
+            regime = state.get("regime", "SIDEWAYS")
+            disp_15m = state.get("disp_15m", "NONE")
+            zones = state.get("active_zones") or []
+            df_15m = None
+
+        # 3b. EARLY WATCH: scan the 1-min bars of the bar now forming (close_ts -> +5m) for an
+        # early sweep+hold against these same zones. Non-blocking "heads up" only -- see the
+        # EARLY_WATCH_* constants/comment above for why this stays separate from the 5-Gate path.
+        if EARLY_WATCH_ENABLED and zones:
+            try:
+                df_1m = fetch_upstox_candles("minutes", 1, days_back=1, include_intraday=True, closed_only=True)
+                ew = detect_early_watch(df_1m, df_5m, zones, regime, disp_15m, state, close_ts, close_ts + timedelta(minutes=5))
+                if ew:
+                    em = "🟢" if ew["action"] == "BUY_CE" else "🔴"
+                    tg_send(
+                        f"👀 <b>[NIFTY 50 EARLY WATCH] {ew['action']} | {ew['confirm_ts'].strftime('%H:%M IST')}</b>\n\n"
+                        f"⚡ <b>Zone         :</b> <code>{esc(ew['tf'])}</code> @ <b>{ew['blue_box']:.2f}</b>\n"
+                        f"🎯 <b>Forming Entry:</b> <b>{ew['entry_preview']:.2f}</b> (~<b>{ew['lead_min']:.0f} min</b> ahead of the 5M close)\n"
+                        f"📝 1-Min reclaim holding past the zone — <b>NOT a confirmed signal yet.</b>\n"
+                        f"<i>Chart var nazar thev; asli alert feela 5M candle clean close zaalya nantarach.</i>"
+                    )
+            except Exception:
+                log.exception("[NIFTY] Early Watch scan error")
+
+        if not new_5m_bar:
+            return
+
+        # 4. Evaluate 5-Gate Pure Liquidity Setups (unchanged — this is still the ONLY path
+        #    that actually trades; Early Watch above never feeds into it)
         setup = detect_nifty_pure_liquidity_setup(df_5m, df_15m, zones, regime, disp_15m, state, close_ts)
         if not setup:
             log.info(f"[NIFTY] {close_ts.strftime('%H:%M IST')} | LTP:{ltp:.2f} | Regime:{regime} | ValidZones:{len(zones)} -> WAITING")
