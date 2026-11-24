@@ -12,12 +12,14 @@ UPGRADES IN V10.6 (backtested on 15 real trading days, 02-20 Nov 2026 1-min NIFT
      hurt 30-min win-rate (35% vs 42.9%) on this sample, so the quality-vetted 5-Gate path
      is kept fully intact and this ships as an optional, clearly-labeled early heads-up only.
      Needs run_nifty_cycle() invoked every ~1 min (not 5) during market hours — see its docstring.
-  2. FIX: HYDROGEN_MODEL default was "gemini-4-hydrogen", which does not exist on the live
-     Gemini API (checked 24 Nov 2026) — now defaults to "gemini-4-argon" (Stable). The two
-     flash-lite model names were already correct and are unchanged.
+  2. Model names unchanged, per Pravesh — stays on "gemini-4-hydrogen" / "gemini-3.5-flash-lite" /
+     "gemini-3.1-flash-lite" (gemini-4-argon is Stable but not on his free tier).
   3. LIVE_CONFIRM_SYS_PROMPT now explicitly asks the AI audit to flag stale/3rd-touch
      reclaims and first-10-min / last-30-min session timing, both common sources of
      early-but-low-quality entries.
+  4. FIX: Early Watch's 1-min scan used to give up on the whole forming bar the moment one
+     sweep attempt failed to hold (e.g. a minute-1 sweep that didn't hold would block a real
+     minute-3 sweep+hold from ever firing) — it now keeps scanning every remaining minute.
 ================================================================================
 PRIOR V10.5 UPGRADES:
   1. Removes noisy CURRENT_DAY_5M micro-ripples & negative-edge DUAL_SIDE_HUNT_PT7.
@@ -60,10 +62,11 @@ NIFTY_SYMBOL_KEY    = "NSE_INDEX|Nifty 50"
 NIFTY_KEY_ENC       = quote(NIFTY_SYMBOL_KEY)
 UPSTOX_V3_BASE      = "https://api.upstox.com/v3"
 
-# Model check (24 Nov 2026 live availability sweep): "gemini-4-hydrogen" does NOT
-# exist on the Gemini API — the live Gemini 4 model is "gemini-4-argon" (Stable).
+# Model check (24 Nov 2026 live availability sweep): "gemini-4-hydrogen" itself didn't turn up
+# on the public model list — "gemini-4-argon" is the one confirmed Stable there — but Pravesh
+# confirmed gemini-4-hydrogen is what's actually wired to his key/tier, so it stays as-is.
 # "gemini-3.5-flash-lite" and "gemini-3.1-flash-lite" are both confirmed Stable, unchanged.
-HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-argon").strip()
+HYDROGEN_MODEL      = os.getenv("GEMINI_HYDROGEN_MODEL", "gemini-4-hydrogen").strip()
 LITE_35_MODEL       = os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite").strip()
 LITE_31_MODEL       = os.getenv("GEMINI_31_LITE_MODEL", "gemini-3.1-flash-lite").strip()
 
@@ -872,23 +875,23 @@ def detect_early_watch(df_1m: pd.DataFrame, df_5m: pd.DataFrame, zones: list, re
         if state.get(ew_key):
             continue
 
-        candidate_bar = None
+        # Scan every minute for a sweep; if one fails to hold, keep looking at later minutes
+        # instead of giving up on the whole bar (a minute-1 sweep that fails must not block a
+        # genuine minute-3 sweep+hold from firing).
         for idx in range(len(sub) - 1):
             m1 = sub.iloc[idx]
-            if _check_early_watch_candidate(df_5m, m1, lvl, action, max_ov):
-                candidate_bar = m1
-                hold_bar = sub.iloc[idx + 1]
-                if _check_early_watch_hold(hold_bar, lvl, action):
-                    state.set(ew_key, True, ttl=EARLY_WATCH_COOLDOWN_MIN * 60)
-                    return {
-                        "action": action, "zone_id": zid, "blue_box": lvl, "tf": b.get("tf", ""),
-                        "entry_preview": float(hold_bar["c"]),
-                        "sweep_ts": _ensure_ist(m1["ts"]), "confirm_ts": _ensure_ist(hold_bar["ts"]),
-                        "lead_min": round((bar_end - _ensure_ist(hold_bar["ts"])).total_seconds() / 60.0, 1),
-                        "why": b.get("why", ""),
-                    }
-                break  # sweep found but didn't hold -> wait for a fresh sweep, don't re-check mid-sequence
-        del candidate_bar
+            if not _check_early_watch_candidate(df_5m, m1, lvl, action, max_ov):
+                continue
+            hold_bar = sub.iloc[idx + 1]
+            if _check_early_watch_hold(hold_bar, lvl, action):
+                state.set(ew_key, True, ttl=EARLY_WATCH_COOLDOWN_MIN * 60)
+                return {
+                    "action": action, "zone_id": zid, "blue_box": lvl, "tf": b.get("tf", ""),
+                    "entry_preview": float(hold_bar["c"]),
+                    "sweep_ts": _ensure_ist(m1["ts"]), "confirm_ts": _ensure_ist(hold_bar["ts"]),
+                    "lead_min": round((bar_end - _ensure_ist(hold_bar["ts"])).total_seconds() / 60.0, 1),
+                    "why": b.get("why", ""),
+                }
     return None
 
 
@@ -1157,7 +1160,7 @@ def run_nifty_cycle(shared_store=None):
                 if ew:
                     em = "🟢" if ew["action"] == "BUY_CE" else "🔴"
                     tg_send(
-                        f"👀 <b>[NIFTY 50 EARLY WATCH] {ew['action']} | {ew['confirm_ts'].strftime('%H:%M IST')}</b>\n\n"
+                        f"👀 {em} <b>[NIFTY 50 EARLY WATCH] {ew['action']} | {ew['confirm_ts'].strftime('%H:%M IST')}</b>\n\n"
                         f"⚡ <b>Zone         :</b> <code>{esc(ew['tf'])}</code> @ <b>{ew['blue_box']:.2f}</b>\n"
                         f"🎯 <b>Forming Entry:</b> <b>{ew['entry_preview']:.2f}</b> (~<b>{ew['lead_min']:.0f} min</b> ahead of the 5M close)\n"
                         f"📝 1-Min reclaim holding past the zone — <b>NOT a confirmed signal yet.</b>\n"
