@@ -1,21 +1,27 @@
 """
 ================================================================================
-BITCOIN (BTCUSD) PURE LIQUIDITY ENGINE — PRODUCTION V10.5 (ZERO-NOISE EDITION)
+BITCOIN (BTCUSD) PURE LIQUIDITY ENGINE — PRODUCTION V10.6 (HUNT-ALERT EDITION)
 Namespace: BTC:* | Delta Exchange India Public API | 100% Price Action
 ================================================================================
-90-DAY BACKTEST VERIFIED (23 Aug – 21 Nov 2026):
-  • 145 Signals (~1.6/day vs 775 noisy 5M alerts) | 1:2 WR: 34.5%
-  • Net Profit: +17.37R (1:2) / +17.65R (1:3) (TREND_PULLBACK +16.77R, SHELF +4.65R)
-  • Zero Lagging Indicators (No EMA / RSI / ATR) · Entry-Only Manual SL/Target
-UPGRADES IN V10.5:
-  1. 15M Clean Sweep & Reclaim Execution (eliminates noisy 5M stop-hunt chop).
-  2. Drops single-touch 1H reversals & noisy flips on BTC; keeps ONLY proven setups:
-     15M TREND_PULLBACK_LIQ_HUNT, MULTI_TOUCH_SHELF (2+ touches), 1D/4H MEGA POOLS,
-     and AI-marked untouched HTF zones with >=35% rejection wick.
-  3. Live Dynamic PA Regime (4H + 1H + 15M rapid displacement guard — never stale).
-  4. Zombie / Broken Zone Purge (Resistance strictly above LTP, Support strictly below).
-  5. Real OHLC Sent to AI (ZERO "Delta" word hallucination in AI verdicts).
-  6. Zone marked spent ONLY AFTER cooldown/lock checks approve the alert.
+V10.6 CHANGES (on top of V10.5):
+  1. 1H-AGREEMENT FILTER: TREND_PULLBACK setups are skipped when the 1H regime is
+     opposite to the 4H-led regime (all 3 losing shorts in the 7-day replay were
+     taken while 1H was TRENDING_BULL).
+  2. CLIMAX_SWEEP_RECLAIM (EXPERIMENTAL): capitulation wick that sweeps the last
+     8h extreme and closes back inside. Runs BEFORE the range gate (the gate used
+     to kill exactly these candles). Alert carries a large-risk warning.
+  3. EARLY HUNT HEADS-UP: every 5M tick, a CLOSED 5M candle that sweeps a valid
+     zone and closes back inside sends a "hunt detected" heads-up (NOT an entry)
+     while the 15M candle is still forming. Full 15M signal follows at 15M close.
+     Disable with BTC_EARLY_HUNT=false.
+  4. AI PROMPTS V2: Python facts block (risk, targets, wicks, 1H/4H regime, nearest
+     opposing zone), 5-check rubric, verdict enforced in Python (missing verdict
+     no longer defaults to APPROVED), AI zone pivots must snap to REAL candle
+     highs/lows (hallucinated levels are dropped).
+  5. GEMINI DAILY CAP (GEMINI_DAILY_CAP, default 200 for BTC): Python alerts keep
+     working when AI budget is exhausted.
+  6. main.py COMPAT: run_btc_1m_tick / run_6h_analysis entry points added.
+  7. Alert shows SL (wick extreme) + 1:2 / 1:3 reference levels and risk in USD.
 ================================================================================
 """
 
@@ -77,12 +83,22 @@ DEEP_BAND_USD       = 5000.0
 SETUP_COOLDOWN_MIN  = int(os.getenv("BTC_SETUP_COOLDOWN_MIN", "60"))
 OPPOSITE_LOCK_MIN   = int(os.getenv("BTC_OPPOSITE_LOCK_MIN", "45"))
 
+# V10.6 additions
+CLIMAX_LOOKBACK      = 32      # 8h of 15M bars
+CLIMAX_MIN_RNG_MULT  = 2.5
+CLIMAX_MAX_RNG_MULT  = 7.0
+MIN_RNG_5M_USD       = 60.0    # early-hunt 5M candle minimum range
+EARLY_HUNT_ENABLED   = os.getenv("BTC_EARLY_HUNT", "true").lower() == "true"
+EARLY_HUNT_COOLDOWN  = 3600    # seconds, per zone
+GEMINI_DAILY_CAP     = int(os.getenv("GEMINI_DAILY_CAP", "200"))
+
 _btc_lock = threading.Lock()
 _ai_rate_lock = threading.Lock()
 _gemini_idx = 0
 _last_gemini_call = 0.0
 _daily_ai_calls = 0
 _daily_ai_date = None
+_cap_warned_date = None
 
 
 def esc(val) -> str:
@@ -170,7 +186,7 @@ def tg_send(text: str) -> bool:
 
 
 # ==============================================================================
-# GEMINI AI ENGINE (SMART 429/503 BACKOFF + NO thinkingBudget:0 BUG)
+# GEMINI AI ENGINE (SMART 429/503 BACKOFF + NO thinkingBudget:0 BUG + DAILY CAP)
 # ==============================================================================
 def _bump_ai_counter():
     global _daily_ai_calls, _daily_ai_date
@@ -179,6 +195,21 @@ def _bump_ai_counter():
         _daily_ai_date = today
         _daily_ai_calls = 0
     _daily_ai_calls += 1
+
+
+def _ai_budget_left() -> bool:
+    """False once today's BTC Gemini calls reach GEMINI_DAILY_CAP (Python alerts keep working)."""
+    global _daily_ai_calls, _daily_ai_date, _cap_warned_date
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    if _daily_ai_date != today:
+        _daily_ai_date = today
+        _daily_ai_calls = 0
+    if _daily_ai_calls >= GEMINI_DAILY_CAP:
+        if _cap_warned_date != today:
+            _cap_warned_date = today
+            log.warning(f"[BTC] Gemini daily cap reached ({_daily_ai_calls}/{GEMINI_DAILY_CAP}) — AI skipped, Python alerts continue")
+        return False
+    return True
 
 
 def _parse_json_safe(raw: str):
@@ -202,6 +233,8 @@ def call_gemini_single(model_name: str, thinking_lvl: str, timeout_sec: int, max
     attempts = max(2, len(GEMINI_API_KEYS))
     srv_503_hits = 0
     for attempt in range(attempts):
+        if not _ai_budget_left():
+            return None
         with _ai_rate_lock:
             wait = 2.2 - (time.time() - _last_gemini_call)
             if wait > 0:
@@ -333,6 +366,67 @@ def format_ohlc_candles(df: pd.DataFrame, limit: int, fmt: str = "%m-%d %H:%M") 
         t_s = _ensure_ist(r["ts"]).strftime(fmt)
         out.append(f"{t_s} O:{float(r['o']):.1f} H:{float(r['h']):.1f} L:{float(r['l']):.1f} C:{float(r['c']):.1f}")
     return out
+
+
+# ==============================================================================
+# AI SAFETY HELPERS (V10.6): REAL-PIVOT SNAP + PYTHON FACTS + ENFORCED VERDICT
+# ==============================================================================
+def _snap_pivot_to_real_extreme(piv: float, ztype: str, frames: list, tol: float = 60.0):
+    """AI pivot must match a REAL candle High (RESISTANCE) / Low (SUPPORT) in the supplied data
+    within tol USD. Returns the snapped real price, or None (hallucinated level -> rejected)."""
+    col = "h" if ztype == "RESISTANCE" else "l"
+    best = None
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        vals = df[col].values
+        j = int(np.argmin(np.abs(vals - piv)))
+        if abs(vals[j] - piv) <= tol and (best is None or abs(vals[j] - piv) < abs(best - piv)):
+            best = float(vals[j])
+    return best
+
+
+def build_confirm_facts(setup: dict, df_15m: pd.DataFrame, zones: list, regime: str, reg_1h: str) -> str:
+    """Python-computed facts so the AI audits instead of re-deriving numbers."""
+    long_ = setup["action"] == "BUY_LONG"
+    entry, ext = float(setup["entry"]), float(setup["wick_extreme"])
+    risk = max(abs(entry - ext), 1e-9)
+    tp2 = entry + 2 * risk if long_ else entry - 2 * risk
+    b = df_15m.iloc[-1]
+    rng = float(b["h"] - b["l"])
+    dn_w = (min(b["o"], b["c"]) - b["l"]) / rng * 100 if rng else 0.0
+    up_w = (b["h"] - max(b["o"], b["c"])) / rng * 100 if rng else 0.0
+    last3 = float(df_15m["c"].iloc[-4:].diff().dropna().sum())
+    opp = [z for z in zones if z["type"] == ("RESISTANCE" if long_ else "SUPPORT")
+           and ((float(z["pivot"]) > entry) if long_ else (float(z["pivot"]) < entry))]
+    opp.sort(key=lambda z: abs(float(z["pivot"]) - entry))
+    nxt = opp[0] if opp else None
+    nxt_txt = (f"{nxt['tf']} @ {float(nxt['pivot']):,.1f} ({abs(float(nxt['pivot']) - entry) / risk:.1f}R away)"
+               if nxt else "none within scan band")
+    return (
+        "PYTHON FACTS (authoritative - do not recompute):\n"
+        f"- Direction: {setup['action']} | Entry: {entry:,.1f} | Invalidation (wick extreme): {ext:,.1f} | Risk: {risk:,.0f} USD\n"
+        f"- 1:2 price target: {tp2:,.1f}\n"
+        f"- Signal candle: range {rng:,.0f} USD | lower wick {dn_w:.0f}% | upper wick {up_w:.0f}% | last-3-bar net move {last3:+,.0f}\n"
+        f"- Regime 4H-led: {regime} | Regime 1H: {reg_1h}\n"
+        f"- Nearest opposing zone: {nxt_txt}"
+    )
+
+
+def verdict_from_checks(res: dict) -> str:
+    """Python enforces the rubric even if the model's own verdict disagrees.
+    Missing/invalid output NEVER defaults to APPROVED."""
+    keys = ["pool", "reclaim", "no_displacement", "trend_ok", "room"]
+    c = (res or {}).get("checks")
+    if not isinstance(c, dict) or not all(k in c for k in keys):
+        v = str((res or {}).get("verdict", "WAIT_CAUTION")).upper()
+        return "WAIT_CAUTION" if v == "APPROVED" else (v if v in ("WAIT_CAUTION", "REJECT_TRAP") else "WAIT_CAUTION")
+    bad = [k for k in keys if c[k] is False]
+    if not bad:
+        return "APPROVED"
+    if len(bad) == 1 and bad[0] != "reclaim":
+        return "WAIT_CAUTION"
+    return "REJECT_TRAP"
 
 
 # ==============================================================================
@@ -470,14 +564,22 @@ def extract_pure_blue_boxes(df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.
 # ==============================================================================
 # DYNAMIC HISTORICAL PRICE-BAND SLICE (ZONE VACUUM < 2 ZONES IN LTP ± $2,500)
 # ==============================================================================
+AI_PIVOT_RULE = (
+    "\nSTRICT: every zone pivot MUST equal an exact High (RESISTANCE) or Low (SUPPORT) printed in the supplied candles - "
+    "never a round/psychological number. Add \"evidence\": \"<candle time you took it from>\". "
+    "If no genuine untouched level exists, return an empty zones list. Max 6 zones."
+)
+
 BAND_SLICE_SYS_PROMPT = (
     "You are the Bitcoin (BTCUSD) Historical Liquidity Archaeologist (100% Pure Price Action — No Indicators).\n"
     "BTC entered an area with fewer than 2 nearby untouched zones.\n"
     "Analyze ONLY the supplied real OHLC historical candles inside LTP ± $5,000 + recent 15M candles.\n"
     "Mark ONLY genuine untouched RESISTANCE strictly ABOVE current LTP and SUPPORT strictly BELOW current LTP.\n"
+    "A level is untouched only if no later supplied candle traded through it.\n"
     "Respond ONLY in strictly valid JSON:\n"
     '{"regime_update": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
-    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "HIST_1D|HIST_4H", "pivot": 0.0, "why": "short reason"}]}'
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "HIST_1D|HIST_4H", "pivot": 0.0, "evidence": "candle time", "why": "short reason"}]}'
+    + AI_PIVOT_RULE
 )
 
 
@@ -517,12 +619,20 @@ def _run_historical_band_slice_worker(shared_store, ltp: float, df_15m: pd.DataF
     if not ai_res or not isinstance(ai_res.get("zones"), list):
         return
 
+    # Real-candle frames the AI could legitimately have used (in-band only)
+    snap_frames = []
+    for df_h in (df_1d_3y, df_4h_10m):
+        if df_h is not None and not df_h.empty:
+            snap_frames.append(df_h[(df_h["h"] >= low_b) & (df_h["l"] <= high_b)])
+
     existing_ai = state.get("ai_zones") or []
     added = []
     for z in ai_res["zones"][:10]:
         try:
-            piv = round(float(z["pivot"]), 1)
             ztype = str(z.get("type", "RESISTANCE")).upper()
+            piv = _snap_pivot_to_real_extreme(round(float(z["pivot"]), 1), ztype, snap_frames)
+            if piv is None:
+                continue
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
                 continue
             if (ztype == "RESISTANCE" and piv <= ltp) or (ztype == "SUPPORT" and piv >= ltp):
@@ -568,10 +678,14 @@ MACRO_6H_SYS_PROMPT = (
     "Zero indicators (No EMA/RSI/ATR). All prices provided are REAL OHLC candle prices.\n"
     "Determine market regime and mark ONLY major untouched Blue Boxes (1D/4H/Multi-Touch Shelf): "
     "RESISTANCE must be strictly ABOVE LTP, SUPPORT must be strictly BELOW LTP (never mark broken levels).\n"
+    "A level is untouched only if no later supplied candle traded through it. Do not repeat levels already in the "
+    "Python Pre-Detected list (within $95); add only genuinely new ones.\n"
+    "if_then_plan must name concrete levels: IF price sweeps <level> and reclaims THEN <direction> toward <next level>.\n"
     "Respond ONLY in strictly valid JSON:\n"
     '{"regime": "TRENDING_BULL|TRENDING_BEAR|SIDEWAYS", '
     '"if_then_plan": "1 concise sentence IF-THEN liquidity plan", '
-    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "1D|4H|1H", "pivot": 0.0, "why": "short reason"}]}'
+    '"zones": [{"type": "RESISTANCE|SUPPORT", "tf": "1D|4H|1H", "pivot": 0.0, "evidence": "candle time", "why": "short reason"}]}'
+    + AI_PIVOT_RULE
 )
 
 
@@ -620,10 +734,13 @@ def _execute_6h_macro_worker(shared_store, is_daily_2330: bool):
     state.set("ai_regime", ai_regime, ttl=21600)
     ai_saved = state.get("ai_zones") or []
     new_cnt = 0
+    snap_frames = [df_1d, df_4h, df_1h]
     for z in (ai_res.get("zones") or [])[:10]:
         try:
-            piv = round(float(z["pivot"]), 1)
             ztype = str(z.get("type", "RESISTANCE")).upper()
+            piv = _snap_pivot_to_real_extreme(round(float(z["pivot"]), 1), ztype, snap_frames)
+            if piv is None:
+                continue
             if ztype not in ("RESISTANCE", "SUPPORT") or abs(piv - ltp) > DEEP_BAND_USD:
                 continue
             if (ztype == "RESISTANCE" and piv <= ltp) or (ztype == "SUPPORT" and piv >= ltp):
@@ -670,14 +787,38 @@ def trigger_6h_macro_if_due(shared_store=None, force: bool = False):
 
 
 # ==============================================================================
-# V10.5 5-GATE PURE LIQUIDITY DETECTOR (15M CLEAN EXECUTION — ZERO 5M CHOP)
+# V10.6 5-GATE PURE LIQUIDITY DETECTOR (15M CLEAN EXECUTION — ZERO 5M CHOP)
 # ==============================================================================
-def detect_btc_pure_liquidity_setup(m15: pd.DataFrame, zones: list, regime: str, disp_15m: str, state: BtcState):
+def _detect_climax_sweep(m15: pd.DataFrame, sc15: float):
+    """EXPERIMENTAL: capitulation wick that sweeps the last-8h extreme and closes back inside.
+    Runs BEFORE the normal range gate (which would reject exactly these big candles)."""
+    k = len(m15) - 1
+    if k < CLIMAX_LOOKBACK + 1:
+        return None
+    b = m15.iloc[k]
+    op, hi, lo, cl = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+    rng = hi - lo
+    if rng < CLIMAX_MIN_RNG_MULT * sc15 or rng > CLIMAX_MAX_RNG_MULT * sc15:
+        return None
+    prior = m15.iloc[k - CLIMAX_LOOKBACK:k]
+    p_low, p_high = float(prior["l"].min()), float(prior["h"].max())
+    dn_w, up_w = (min(op, cl) - lo) / rng, (hi - max(op, cl)) / rng
+    if lo < p_low - MIN_PIERCE_USD and cl > p_low and dn_w >= 0.5 and (cl - lo) / rng >= 0.75:
+        return {"name": "CLIMAX_SWEEP_RECLAIM", "action": "BUY_LONG", "zone_id": "", "blue_box": round(p_low, 1),
+                "wick_extreme": round(lo, 1), "entry": cl,
+                "reason": f"Climax wick swept 8h low ${p_low:,.1f} by ${p_low - lo:,.1f} & closed back inside ({dn_w * 100:.0f}% wick)"}
+    if hi > p_high + MIN_PIERCE_USD and cl < p_high and up_w >= 0.5 and (hi - cl) / rng >= 0.75:
+        return {"name": "CLIMAX_SWEEP_RECLAIM", "action": "SELL_SHORT", "zone_id": "", "blue_box": round(p_high, 1),
+                "wick_extreme": round(hi, 1), "entry": cl,
+                "reason": f"Climax wick swept 8h high ${p_high:,.1f} by ${hi - p_high:,.1f} & closed back inside ({up_w * 100:.0f}% wick)"}
+    return None
+
+
+def detect_btc_pure_liquidity_setup(m15: pd.DataFrame, zones: list, regime: str, disp_15m: str, state: BtcState, reg_1h=None):
     """
-    Evaluates completed 15M candle against 5 strict quality gates.
-    BTC V10.5 keeps ONLY proven high-edge setups:
-      1. 1D / 4H Mega Blue Boxes & Multi-Touch Shelves (2+ touches) with >=35% rejection wick
-      2. 15M Trend Pullback Liquidity Hunt (+16.77R proven over 90 days)
+    Evaluates completed 15M candle against strict quality gates.
+    Setups: 1D/4H Mega Blue Boxes & Multi-Touch Shelves (>=35% wick), 15M Trend Pullback Liquidity Hunt
+    (skipped when 1H regime opposes the 4H-led regime), CLIMAX_SWEEP_RECLAIM (experimental).
     """
     if m15 is None or len(m15) < 16:
         return None
@@ -687,6 +828,10 @@ def detect_btc_pure_liquidity_setup(m15: pd.DataFrame, zones: list, regime: str,
     op, hi, lo, cl = float(c_bar["o"]), float(c_bar["h"]), float(c_bar["l"]), float(c_bar["c"])
     sc15 = _median_range(m15, 20)
     rng = hi - lo
+
+    cx = _detect_climax_sweep(m15, sc15)
+    if cx:
+        return cx
 
     if rng < MIN_RNG_15M_USD or rng > MAX_RNG_MULT * sc15:
         return None
@@ -740,6 +885,8 @@ def detect_btc_pure_liquidity_setup(m15: pd.DataFrame, zones: list, regime: str,
 
     # 2. 15M Trend Pullback Liquidity Hunt (BTC's #1 Proven Edge)
     hh15, ll15 = m15["h"].values, m15["l"].values
+    if reg_1h is not None and ((regime == "TRENDING_BULL" and reg_1h == "TRENDING_BEAR") or (regime == "TRENDING_BEAR" and reg_1h == "TRENDING_BULL")):
+        return None   # pullback sweep against the 1H trend is not a real pullback
     if regime == "TRENDING_BULL":
         pb_idx = k - 6 + int(np.argmin(ll15[k - 6 : k - 1]))
         pb_low = float(ll15[pb_idx])
@@ -769,14 +916,110 @@ def detect_btc_pure_liquidity_setup(m15: pd.DataFrame, zones: list, regime: str,
 
 
 # ==============================================================================
+# V10.6 EARLY HUNT HEADS-UP (CLOSED 5M CANDLE INSIDE THE STILL-FORMING 15M CANDLE)
+# ==============================================================================
+def detect_early_hunt(m5: pd.DataFrame, df_15m: pd.DataFrame, zones: list, regime: str, disp_15m: str, state: BtcState):
+    """Heads-up only (NOT an entry). A closed 5M candle that swept a valid zone and closed back inside,
+    while the 15M candle is still forming. Never marks a zone spent; own per-zone cooldown."""
+    if m5 is None or len(m5) < 3 or df_15m is None or len(df_15m) < 6 or not zones:
+        return None
+    forming_start = int(df_15m["time"].iloc[-1]) + 900
+    b = m5.iloc[-1]
+    if int(b["time"]) < forming_start:
+        return None   # belongs to an already-closed 15M candle -> the 15M cycle handles it
+    op, hi, lo, cl = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+    rng = hi - lo
+    if rng < MIN_RNG_5M_USD:
+        return None
+    up_w, dn_w = (hi - max(op, cl)) / rng, (min(op, cl) - lo) / rng
+    sc15 = _median_range(df_15m, 20)
+    max_ov = min(MAX_OVERSHOOT_USD, 2.2 * sc15)
+    prev4_c = df_15m["c"].iloc[-4:].values
+
+    for z in zones:
+        zid = z["id"]
+        if state.is_spent(zid) or state.get(f"early_{zid}"):
+            continue
+        if z.get("tf") == "1H_BLUE_BOX" and z.get("touches", 1) < 2 and not str(z.get("source", "")).startswith("AI_"):
+            continue
+        lvl = float(z["pivot"])
+        if abs(lvl - cl) > SCAN_RADIUS_USD:
+            continue
+        action = "SELL_SHORT" if z["type"] == "RESISTANCE" else "BUY_LONG"
+        if (action == "SELL_SHORT" and disp_15m == "TRENDING_BULL") or (action == "BUY_LONG" and disp_15m == "TRENDING_BEAR"):
+            continue
+        if action == "BUY_LONG" and int(np.sum(prev4_c > lvl)) < 2:
+            continue
+        if action == "SELL_SHORT" and int(np.sum(prev4_c < lvl)) < 2:
+            continue
+        is_mega = z.get("tf") in ("1D_BLUE_BOX", "4H_BLUE_BOX", "HIST_1D", "HIST_4H")
+        if not is_mega and ((action == "SELL_SHORT" and regime == "TRENDING_BULL") or (action == "BUY_LONG" and regime == "TRENDING_BEAR")):
+            continue
+        if action == "BUY_LONG":
+            pierce = lvl - lo
+            if MIN_PIERCE_USD <= pierce <= max_ov and cl > lvl and dn_w >= 0.35:
+                return {"zone_id": zid, "action": action, "level": lvl, "wick_extreme": round(lo, 1), "close": cl,
+                        "pierce": pierce, "tf": z.get("tf", ""), "bar_time": int(b["time"]), "confirm_at": forming_start + 900}
+        else:
+            pierce = hi - lvl
+            if MIN_PIERCE_USD <= pierce <= max_ov and cl < lvl and up_w >= 0.35:
+                return {"zone_id": zid, "action": action, "level": lvl, "wick_extreme": round(hi, 1), "close": cl,
+                        "pierce": pierce, "tf": z.get("tf", ""), "bar_time": int(b["time"]), "confirm_at": forming_start + 900}
+    return None
+
+
+def _early_hunt_check(state: BtcState, df_15m: pd.DataFrame):
+    """Runs on every 5M tick using CACHED zones (no extra heavy fetches). Never raises."""
+    try:
+        cached = state.get("active_zones") or []
+        if not cached:
+            return
+        ltp = float(df_15m["c"].iloc[-1])
+        zones = [z for z in cached if not state.is_spent(z["id"]) and not _is_zone_broken_or_zombie(z, df_15m, ltp)]
+        if not zones:
+            return
+        m5 = fetch_delta_candles("5m", hours_back=2, closed_only=True)
+        regime = state.get("regime") or "SIDEWAYS"
+        disp_15m = get_live_pa_regime(None, None, df_15m)[1]
+        hunt = detect_early_hunt(m5, df_15m, zones, regime, disp_15m, state)
+        if not hunt:
+            return
+        state.set(f"early_{hunt['zone_id']}", True, ttl=EARLY_HUNT_COOLDOWN)
+        em = "🟢" if hunt["action"] == "BUY_LONG" else "🔴"
+        side = "BULLISH (long bias)" if hunt["action"] == "BUY_LONG" else "BEARISH (short bias)"
+        t_now = _ensure_ist(pd.Timestamp(hunt["bar_time"] + 300, unit="s", tz="UTC")).strftime("%H:%M IST")
+        t_cf = _ensure_ist(pd.Timestamp(hunt["confirm_at"], unit="s", tz="UTC")).strftime("%H:%M IST")
+        tg_send(
+            f"👀{em} <b>[BITCOIN] LIQUIDITY HUNT DETECTED (5M) | {t_now}</b>\n\n"
+            f"🟦 <b>Zone:</b> {esc(hunt['tf'])} @ <b>${hunt['level']:,.1f}</b> swept by <b>${hunt['pierce']:,.1f}</b>\n"
+            f"🕯️ <b>5M close:</b> <b>${hunt['close']:,.1f}</b> (back inside) | <b>Wick ext:</b> ${hunt['wick_extreme']:,.1f}\n"
+            f"🧭 <b>Bias:</b> {side}\n\n"
+            f"⚠️ <i>HEADS-UP, entry nahi. 15M candle ajun band zhali nahi — {t_cf} la confirm alert yeil (zhalyas).</i>"
+        )
+        log.info(f"[BTC] 👀 EARLY HUNT: {hunt['action']} zone {hunt['zone_id']} lvl ${hunt['level']:,.1f}")
+    except Exception as e:
+        log.warning(f"[BTC] Early hunt check error: {type(e).__name__}")
+
+
+# ==============================================================================
 # PARALLEL NON-BLOCKING BACKGROUND AI CONFIRMATION (REAL OHLC — ZERO HALLUCINATION)
 # ==============================================================================
 LIVE_CONFIRM_SYS_PROMPT = (
-    "You are the Bitcoin (BTCUSD) Institutional Pure Price-Action Supervisor (Zero Indicators, No Orderflow/Volume Delta).\n"
-    "All candle prices provided below are ACTUAL OHLC USD chart prices.\n"
-    "Audit the 15M liquidity sweep & reclaim quality, wick rejection strength, trend alignment, and nearby opposing walls.\n"
-    "Respond ONLY in strictly valid JSON:\n"
-    '{"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", "note": "1-2 concise pure price-action sentences"}'
+    "You are a strict Bitcoin (BTCUSD) price-action auditor. Zero indicators, no orderflow/volume delta. "
+    "Candle prices are real chart OHLC in USD.\n"
+    "The user message has a PYTHON FACTS block: treat its numbers as authoritative; never recompute or invent levels.\n"
+    "Judge each check true/false using ONLY the facts and candles supplied:\n"
+    "1. pool: the sweep took out a visible cluster/extreme of prior highs or lows in the supplied candles.\n"
+    "2. reclaim: the signal candle closed back inside the level with real rejection (no acceptance beyond it).\n"
+    "3. no_displacement: the last 3 candles do not show strong momentum AGAINST the trade.\n"
+    "4. trend_ok: the trade is not against BOTH the 1H and 4H regime.\n"
+    "5. room: the nearest opposing zone is at least 1.5R away (or none).\n"
+    "Verdict: APPROVED = all 5 true. WAIT_CAUTION = exactly 1 false. REJECT_TRAP = 2+ false, or check 2 false. "
+    "When unsure choose the more cautious verdict. No praise, no filler.\n"
+    "Respond ONLY with valid JSON: "
+    '{"checks": {"pool": true, "reclaim": true, "no_displacement": true, "trend_ok": true, "room": true}, '
+    '"verdict": "APPROVED|WAIT_CAUTION|REJECT_TRAP", "confidence": "HIGH|MEDIUM|LOW", '
+    '"note": "max 25 words, cite the candle time of the key evidence"}'
 )
 
 
@@ -785,14 +1028,19 @@ def _background_ai_confirm_worker(setup: dict, usr_p: str, signal_time: str):
     if not ai_res:
         log.warning(f"[BTC] Background AI confirm unreachable ({provider})")
         return
-    verdict = ai_res.get("verdict", "APPROVED")
+    verdict = verdict_from_checks(ai_res)
     conf = ai_res.get("confidence", "MEDIUM")
     note = ai_res.get("note", "")
+    checks = ai_res.get("checks") if isinstance(ai_res.get("checks"), dict) else {}
+    failed = [k for k, v in checks.items() if v is False]
     badge = "✅" if verdict == "APPROVED" else ("⚠️" if verdict == "WAIT_CAUTION" else "🛑")
+    log.info(f"AI_VERDICT|{setup['name']}|{setup['action']}|{setup['entry']}|{verdict}|{conf}|failed={','.join(failed) or '-'}")
+    fail_line = f"\n❌ <b>Failed checks:</b> <code>{esc(', '.join(failed))}</code>" if failed else ""
     tg_send(
         f"{badge} <b>[BTC AI CONFIRMATION | {signal_time}]</b>\n"
         f"⚡ <b>Setup:</b> <code>{esc(setup['name'])}</code> ({esc(setup['action'])}) @ <b>${setup['entry']:,.1f}</b>\n"
-        f"🧠 <b>Model:</b> <code>{esc(provider)}</code> | <b>Verdict:</b> <b>[{esc(verdict)} | {esc(conf)}]</b>\n"
+        f"🧠 <b>Model:</b> <code>{esc(provider)}</code> | <b>Verdict:</b> <b>[{esc(verdict)} | {esc(conf)}]</b>"
+        f"{fail_line}\n"
         f"<i>{esc(note)}</i>"
     )
 
@@ -810,10 +1058,11 @@ def run_startup_diagnostics(shared_store=None) -> dict:
 
 
 # ==============================================================================
-# MAIN CYCLE (EVALUATES EVERY CLOSED 15M CANDLE — ZERO NOISE)
+# MAIN CYCLE (EVALUATES EVERY CLOSED 15M CANDLE + 5M EARLY-HUNT HEADS-UP)
 # ==============================================================================
 def run_btc_cycle(shared_store=None):
     if not _btc_lock.acquire(blocking=False):
+        log.warning("[BTC] Previous cycle still running — tick skipped")
         return
     try:
         state = BtcState(shared_store)
@@ -824,7 +1073,12 @@ def run_btc_cycle(shared_store=None):
         # 2. Fetch closed 15M candles
         df_15m = fetch_delta_candles("15m", hours_back=24 * 3, closed_only=True)
         if df_15m.empty or len(df_15m) < 25:
+            log.warning("[BTC] 15M feed empty/short — cycle skipped")
             return
+
+        # 2b. 5M early-hunt heads-up (uses cached zones; runs every tick, before the 15M de-dup return)
+        if EARLY_HUNT_ENABLED:
+            _early_hunt_check(state, df_15m)
 
         last_15m_t = int(df_15m["time"].iloc[-1])
         if state.get("last_eval_15m") == last_15m_t:
@@ -839,6 +1093,7 @@ def run_btc_cycle(shared_store=None):
 
         # Live Dynamic PA Regime (never stale)
         live_regime, disp_15m = get_live_pa_regime(df_4h, df_1h, df_15m)
+        reg_1h = get_live_pa_regime(None, df_1h, df_15m)[0]
         ai_reg = state.get("ai_regime")
         regime = live_regime if (live_regime != "SIDEWAYS" or not ai_reg) else ai_reg
         state.set("regime", regime, ttl=7200)
@@ -856,10 +1111,10 @@ def run_btc_cycle(shared_store=None):
         # 3. Zone Vacuum Check (< 2 zones in LTP ± $2,500) -> 3-Yr Band Slice
         check_zone_vacuum_and_trigger_band(state, zones, ltp, df_15m)
 
-        # 4. Evaluate 5-Gate Pure Liquidity Setups
-        setup = detect_btc_pure_liquidity_setup(df_15m, zones, regime, disp_15m, state)
+        # 4. Evaluate Pure Liquidity Setups
+        setup = detect_btc_pure_liquidity_setup(df_15m, zones, regime, disp_15m, state, reg_1h=reg_1h)
         if not setup:
-            log.info(f"[BTC] {close_ts.strftime('%H:%M IST')} | LTP:${ltp:,.1f} | Regime:{regime} | ValidZones:{len(zones)} -> WAITING")
+            log.info(f"[BTC] {close_ts.strftime('%H:%M IST')} | LTP:${ltp:,.1f} | Regime:{regime} (1H:{reg_1h}) | ValidZones:{len(zones)} -> WAITING")
             return
 
         # Gate 5: Check cooldowns & opposite lock BEFORE marking zone spent!
@@ -879,28 +1134,39 @@ def run_btc_cycle(shared_store=None):
         state.set("last_sig_ts", time.time(), ttl=OPPOSITE_LOCK_MIN * 60)
         state.set(cd_key, True, ttl=SETUP_COOLDOWN_MIN * 60)
 
-        # 5. PYTHON-FIRST INSTANT TELEGRAM ALERT
+        # 5. PYTHON-FIRST INSTANT TELEGRAM ALERT (fires ~15s after the 15M candle that did the hunt closes)
         em = "🟢" if setup["action"] == "BUY_LONG" else "🔴"
         title_act = "BUY (LONG)" if setup["action"] == "BUY_LONG" else "SELL (SHORT)"
         sig_time_str = close_ts.strftime("%H:%M IST")
+        long_ = setup["action"] == "BUY_LONG"
+        risk = abs(setup["entry"] - setup["wick_extreme"])
+        tp2 = setup["entry"] + 2 * risk if long_ else setup["entry"] - 2 * risk
+        tp3 = setup["entry"] + 3 * risk if long_ else setup["entry"] - 3 * risk
+        warn = ""
+        if setup["name"] == "CLIMAX_SWEEP_RECLAIM":
+            warn = f"⚠️ <b>EXPERIMENTAL</b> | Risk to wick: <b>${risk:,.0f}</b> (bada risk, size kami thev)\n"
         msg = (
             f"{em} <b>[BITCOIN - BTCUSD] {title_act} | {sig_time_str} (15M)</b>\n\n"
             f"⚡ <b>Setup        :</b> <code>{esc(setup['name'])}</code>\n"
             f"🎯 <b>Entry Price  :</b> <b>${setup['entry']:,.1f}</b>\n"
             f"🟦 <b>Blue Box Lvl :</b> <b>${setup['blue_box']:,.1f}</b> | <b>Yellow Wick Ext:</b> <b>${setup['wick_extreme']:,.1f}</b>\n"
-            f"🧭 <b>Live Regime  :</b> <code>{esc(regime)}</code>\n"
-            f"📝 <b>Sweep Logic  :</b> {esc(setup['reason'])}\n\n"
+            f"🛑 <b>SL ref (wick):</b> <code>${setup['wick_extreme']:,.1f}</code> | Risk <code>${risk:,.0f}</code>\n"
+            f"🏁 <b>Ref targets  :</b> 1:2 <code>${tp2:,.1f}</code> | 1:3 <code>${tp3:,.1f}</code>\n"
+            f"🧭 <b>Live Regime  :</b> <code>{esc(regime)}</code> (1H: <code>{esc(reg_1h)}</code>)\n"
+            f"📝 <b>Sweep Logic  :</b> {esc(setup['reason'])}\n"
+            f"{warn}\n"
             f"⏳ <i>Chart baghun manual confirm kar (Manual SL &amp; Target mode). Running parallel AI audit...</i>"
         )
         tg_send(msg)
         log.info(f"[BTC] 🔥 QUALITY ALERT: {setup['name']} ({setup['action']}) @ ${setup['entry']:,.1f}")
 
-        # 6. Parallel Background AI Audit with REAL OHLC (No "Delta" word)
+        # 6. Parallel Background AI Audit with REAL OHLC + PYTHON FACTS (No "Delta" word)
+        facts = build_confirm_facts(setup, df_15m, zones, regime, reg_1h)
         df_5m = fetch_delta_candles("5m", hours_back=8, closed_only=True)
         usr_p = (
-            f"Asset: BITCOIN (BTCUSD) | Time: {sig_time_str} | Entry: ${setup['entry']:,.1f}\n"
-            f"Setup: {setup['name']} ({setup['action']}) | Blue Box: ${setup['blue_box']:,.1f} | Wick Ext: ${setup['wick_extreme']:,.1f}\n"
-            f"Live Regime: {regime} | Reason: {setup['reason']}\n"
+            f"Asset: BITCOIN (BTCUSD) | Time: {sig_time_str}\n{facts}\n"
+            f"Setup: {setup['name']} | Blue Box: ${setup['blue_box']:,.1f}\n"
+            f"Python reason: {setup['reason']}\n"
             f"Recent 20 15M Real OHLC Candles:\n" + "\n".join(format_ohlc_candles(df_15m, 20)) + "\n"
             f"Recent 24 5M Real OHLC Candles:\n" + "\n".join(format_ohlc_candles(df_5m, 24))
         )
@@ -908,8 +1174,25 @@ def run_btc_cycle(shared_store=None):
 
     except Exception as e:
         log.exception(f"[BTC] Cycle error: {type(e).__name__}")
+        try:
+            BtcState(shared_store).set("last_eval_15m", 0, ttl=60)   # let the next tick retry this candle
+        except Exception:
+            pass
     finally:
         try:
             _btc_lock.release()
         except RuntimeError:
             pass
+
+
+# ==============================================================================
+# main.py ENTRY POINTS (main.py V8.5 looks these names up with getattr)
+# ==============================================================================
+def run_btc_1m_tick(shared_store=None):
+    """5-minute scheduler entry: 15M cycle + 5M early-hunt heads-up."""
+    run_btc_cycle(shared_store)
+
+
+def run_6h_analysis(shared_store=None):
+    """6-hour scheduler entry: de-duplicated against the in-cycle trigger via the slot key."""
+    trigger_6h_macro_if_due(shared_store, force=False)
